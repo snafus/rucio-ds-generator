@@ -307,6 +307,32 @@ class TestPlaceFile:
         with open(final, "rb") as fh:
             assert fh.read() == b"crossfs"
 
+    def test_part_file_cleaned_up_on_crossfs_copy_failure(self, tmp_path):
+        """If shutil.copy2 fails on a cross-filesystem move, the partial .part must be removed."""
+        tmp_file = str(tmp_path / "src.tmp")
+        with open(tmp_file, "wb") as fh:
+            fh.write(b"data")
+        final = str(tmp_path / "dst.dat")
+
+        exdev = OSError()
+        exdev.errno = errno.EXDEV
+        rename_calls = [0]
+        real_rename = os.rename
+        def patched_rename(src, dst):
+            if rename_calls[0] == 0:
+                rename_calls[0] += 1
+                raise exdev
+            return real_rename(src, dst)
+
+        with patch("os.rename", side_effect=patched_rename):
+            with patch("shutil.copy2", side_effect=OSError("disk full")):
+                with pytest.raises(OSError, match="disk full"):
+                    _place_file(tmp_file, final)
+
+        # .part file must not remain on the RSE
+        leftover = [f for f in os.listdir(str(tmp_path)) if ".part." in f]
+        assert leftover == [], "orphaned .part files: {}".format(leftover)
+
     def test_part_file_cleaned_up_on_final_rename_failure(self, tmp_path):
         """If the final rename (.part → final) fails, the .part file must be removed."""
         tmp_file = str(tmp_path / "src.tmp")

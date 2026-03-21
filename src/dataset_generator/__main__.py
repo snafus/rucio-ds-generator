@@ -374,12 +374,20 @@ def _run_full_pipeline(config, state, rucio_manager, registry=None):
 
     # Step 6: Create the replication rule on the dataset DID.
     if registered_entries:
-        rule_id = rucio_manager.add_replication_rule(
-            scope=config.scope,
-            dataset_name=config.dataset_name,
-            rse=config.rse,
-            lifetime=config.rule_lifetime,
-        )
+        try:
+            rule_id = rucio_manager.add_replication_rule(
+                scope=config.scope,
+                dataset_name=config.dataset_name,
+                rse=config.rse,
+                lifetime=config.rule_lifetime,
+            )
+        except Exception as exc:
+            log.error("add_replication_rule failed: %s", exc)
+            for entry in registered_entries:
+                if entry.get("status") == FileStatus.REGISTERED:
+                    state.update(entry["key"], status=FileStatus.FAILED_RULE)
+                    failures += 1
+            return failures
         # Mark all registered files as ruled.
         for entry in registered_entries:
             if entry.get("status") == FileStatus.REGISTERED:
@@ -421,10 +429,16 @@ def _run_register_only(config, state, rucio_manager, registry=None):
             for e in registered_entries
         ]
         rucio_manager.attach_dids(config.scope, config.dataset_name, file_dids)
-        rule_id = rucio_manager.add_replication_rule(
-            config.scope, config.dataset_name, config.rse,
-            lifetime=config.rule_lifetime,
-        )
+        try:
+            rule_id = rucio_manager.add_replication_rule(
+                config.scope, config.dataset_name, config.rse,
+                lifetime=config.rule_lifetime,
+            )
+        except Exception as exc:
+            log.error("add_replication_rule failed: %s", exc)
+            for entry in registered_entries:
+                state.update(entry["key"], status=FileStatus.FAILED_RULE)
+            return failures + len(registered_entries)
         for entry in registered_entries:
             state.update(entry["key"], status=FileStatus.RULED, rule_id=rule_id)
         _update_registry(config, registry, rule_id, len(registered_entries))

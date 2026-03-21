@@ -317,7 +317,15 @@ def _place_file(staging_path, local_pfn, uid=None, gid=None):
         if exc.errno != errno.EXDEV:
             raise
         # Cross-filesystem: copy bytes then remove the staging copy.
-        shutil.copy2(staging_path, part_path)
+        # Clean up any partial .part file if the copy fails (e.g. disk full).
+        try:
+            shutil.copy2(staging_path, part_path)
+        except Exception:
+            try:
+                os.unlink(part_path)
+            except OSError:
+                pass
+            raise
         os.unlink(staging_path)
 
     # Steps 2 & 3: chown then atomic rename on the RSE filesystem.

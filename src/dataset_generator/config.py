@@ -494,6 +494,15 @@ class Config(object):
             raise ConfigError(
                 "rule_lifetime must be >= 1 second, got {}".format(self.rule_lifetime)
             )
+        if self.generation_mode == "buffer-reuse":
+            _min_ring = 128 * 1024 * 1024  # must match CHUNK_SIZE in writers.py
+            if self.buffer_reuse_ring_size < _min_ring:
+                raise ConfigError(
+                    "buffer_reuse_ring_size ({} bytes) must be >= 128 MiB ({} bytes) "
+                    "when using buffer-reuse mode".format(
+                        self.buffer_reuse_ring_size, _min_ring
+                    )
+                )
         if not self.dry_run and not os.path.isdir(self.rse_mount):
             raise ConfigError(
                 "rse_mount '{}' is not a directory or does not exist. "
