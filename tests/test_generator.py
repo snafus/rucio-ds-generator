@@ -116,9 +116,10 @@ class TestWriteFile:
     def test_adler32_matches_manual_computation(self, tmp_path):
         """Write a known byte sequence and verify the checksum externally."""
         path = str(tmp_path / "known_file")
-        # Patch os.urandom to return deterministic data
+        # Patch the module-level _randbytes so the test is independent of
+        # which PRNG was selected at import time (os.urandom vs random.randbytes).
         fixed_data = b"A" * 512
-        with patch("os.urandom", return_value=fixed_data):
+        with patch("dataset_generator.generator._randbytes", return_value=fixed_data):
             checksum, size = _write_file(path, 512)
 
         expected = zlib.adler32(fixed_data, 1) & 0xFFFFFFFF
@@ -135,13 +136,13 @@ class TestWriteFile:
         all_data = [chunk, second]
         call_count = [0]
 
-        def fake_urandom(n):
+        def fake_randbytes(n):
             data = all_data[call_count[0]]
             call_count[0] += 1
             return data
 
         path = str(tmp_path / "big_file")
-        with patch("os.urandom", side_effect=fake_urandom):
+        with patch("dataset_generator.generator._randbytes", side_effect=fake_randbytes):
             checksum, size = _write_file(path, CHUNK_SIZE + 512)
 
         expected = zlib.adler32(chunk, 1) & 0xFFFFFFFF
