@@ -333,6 +333,21 @@ class TestValidation:
         cfg = _make_config(rule_lifetime=86400)
         cfg.validate()  # should not raise
 
+    def test_buffer_reuse_ring_size_too_small_raises(self):
+        cfg = _make_config(generation_mode="buffer-reuse", buffer_reuse_ring_size=1024)
+        with pytest.raises(ConfigError, match="buffer_reuse_ring_size"):
+            cfg.validate()
+
+    def test_buffer_reuse_ring_size_valid_passes(self):
+        cfg = _make_config(generation_mode="buffer-reuse",
+                           buffer_reuse_ring_size=128 * 1024 * 1024)
+        cfg.validate()  # should not raise
+
+    def test_buffer_reuse_ring_size_not_checked_for_csprng_mode(self):
+        # A bad ring size is irrelevant when mode is csprng — must not raise.
+        cfg = _make_config(generation_mode="csprng", buffer_reuse_ring_size=1024)
+        cfg.validate()  # should not raise
+
     def test_missing_rse_mount_raises(self):
         cfg = _make_config(rse_mount="/nonexistent_path_xyz")
         with pytest.raises(ConfigError, match="rse_mount"):

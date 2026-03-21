@@ -16,16 +16,19 @@ import pytest
 
 from dataset_generator.config import Config
 from dataset_generator.generator import (
-    CHUNK_SIZE,
     _generate_one,
     _makedirs_chown,
     _pfn_to_local,
     _place_file,
     _state_key,
-    _write_file,
     run_generation,
 )
 from dataset_generator.state import FileStatus, StateFile
+from dataset_generator.writers import (
+    CHUNK_SIZE,
+    CsprngFileWriter,
+    _randbytes,  # noqa: F401 — imported to allow patch target verification
+)
 
 
 # ---------------------------------------------------------------------------
@@ -72,6 +75,12 @@ def state(tmp_path):
 
 
 @pytest.fixture
+def writer():
+    """Default CsprngFileWriter instance for use in generation tests."""
+    return CsprngFileWriter()
+
+
+@pytest.fixture
 def mock_rucio(rse_mount):
     """Mock RucioManager whose lfns2pfn returns a predictable POSIX path."""
     manager = MagicMock()
@@ -101,32 +110,38 @@ class TestStateKey:
 # ---------------------------------------------------------------------------
 
 class TestWriteFile:
-    def test_creates_file_of_correct_size(self, tmp_path):
+    """Tests for CsprngFileWriter.write_file (the default FileWriter implementation)."""
+
+    @pytest.fixture
+    def writer(self):
+        return CsprngFileWriter()
+
+    def test_creates_file_of_correct_size(self, tmp_path, writer):
         path = str(tmp_path / "test_file")
-        checksum, size = _write_file(path, 4096)
+        checksum, size = writer.write_file(path, 4096)
         assert size == 4096
         assert os.path.getsize(path) == 4096
 
-    def test_adler32_mask_applied(self, tmp_path):
+    def test_adler32_mask_applied(self, tmp_path, writer):
         """Checksum value must fit in 32 bits (result of & 0xFFFFFFFF)."""
         path = str(tmp_path / "test_file")
-        checksum, _ = _write_file(path, 512)
+        checksum, _ = writer.write_file(path, 512)
         assert 0 <= checksum <= 0xFFFFFFFF
 
-    def test_adler32_matches_manual_computation(self, tmp_path):
+    def test_adler32_matches_manual_computation(self, tmp_path, writer):
         """Write a known byte sequence and verify the checksum externally."""
         path = str(tmp_path / "known_file")
-        # Patch the module-level _randbytes so the test is independent of
-        # which PRNG was selected at import time (os.urandom vs random.randbytes).
+        # Patch the module-level _randbytes in writers so the test is independent
+        # of which PRNG was selected at import time.
         fixed_data = b"A" * 512
-        with patch("dataset_generator.generator._randbytes", return_value=fixed_data):
-            checksum, size = _write_file(path, 512)
+        with patch("dataset_generator.writers._randbytes", return_value=fixed_data):
+            checksum, size = writer.write_file(path, 512)
 
         expected = zlib.adler32(fixed_data, 1) & 0xFFFFFFFF
         assert checksum == expected
         assert size == 512
 
-    def test_incremental_checksum_over_multiple_chunks(self, tmp_path):
+    def test_incremental_checksum_over_multiple_chunks(self, tmp_path, writer):
         """
         File larger than CHUNK_SIZE: checksum must equal the result of
         running zlib.adler32 over the concatenated chunks.
@@ -142,29 +157,27 @@ class TestWriteFile:
             return data
 
         path = str(tmp_path / "big_file")
-        with patch("dataset_generator.generator._randbytes", side_effect=fake_randbytes):
-            checksum, size = _write_file(path, CHUNK_SIZE + 512)
+        with patch("dataset_generator.writers._randbytes", side_effect=fake_randbytes):
+            checksum, size = writer.write_file(path, CHUNK_SIZE + 512)
 
         expected = zlib.adler32(chunk, 1) & 0xFFFFFFFF
         expected = zlib.adler32(second, expected) & 0xFFFFFFFF
         assert checksum == expected
         assert size == CHUNK_SIZE + 512
 
-    def test_file_contents_readable(self, tmp_path):
+    def test_file_contents_readable(self, tmp_path, writer):
         path = str(tmp_path / "readable")
-        _write_file(path, 256)
+        writer.write_file(path, 256)
         with open(path, "rb") as fh:
             content = fh.read()
         assert len(content) == 256
 
-    def test_size_mismatch_raises(self, tmp_path):
+    def test_size_mismatch_raises(self, tmp_path, writer):
         """If the on-disk size does not match the requested size, raise RuntimeError."""
         path = str(tmp_path / "truncated")
-        # Simulate a short write by making os.stat report the wrong size.
         real_stat = os.stat
         def fake_stat(p, **kw):
             result = real_stat(p, **kw)
-            # Return a stat_result with st_size = 0 to simulate truncation.
             return os.stat_result((
                 result.st_mode, result.st_ino, result.st_dev,
                 result.st_nlink, result.st_uid, result.st_gid,
@@ -173,7 +186,7 @@ class TestWriteFile:
             ))
         with patch("os.stat", side_effect=fake_stat):
             with pytest.raises(RuntimeError, match="File size mismatch"):
-                _write_file(path, 256)
+                writer.write_file(path, 256)
 
 
 # ---------------------------------------------------------------------------
@@ -294,6 +307,32 @@ class TestPlaceFile:
         with open(final, "rb") as fh:
             assert fh.read() == b"crossfs"
 
+    def test_part_file_cleaned_up_on_crossfs_copy_failure(self, tmp_path):
+        """If shutil.copy2 fails on a cross-filesystem move, the partial .part must be removed."""
+        tmp_file = str(tmp_path / "src.tmp")
+        with open(tmp_file, "wb") as fh:
+            fh.write(b"data")
+        final = str(tmp_path / "dst.dat")
+
+        exdev = OSError()
+        exdev.errno = errno.EXDEV
+        rename_calls = [0]
+        real_rename = os.rename
+        def patched_rename(src, dst):
+            if rename_calls[0] == 0:
+                rename_calls[0] += 1
+                raise exdev
+            return real_rename(src, dst)
+
+        with patch("os.rename", side_effect=patched_rename):
+            with patch("shutil.copy2", side_effect=OSError("disk full")):
+                with pytest.raises(OSError, match="disk full"):
+                    _place_file(tmp_file, final)
+
+        # .part file must not remain on the RSE
+        leftover = [f for f in os.listdir(str(tmp_path)) if ".part." in f]
+        assert leftover == [], "orphaned .part files: {}".format(leftover)
+
     def test_part_file_cleaned_up_on_final_rename_failure(self, tmp_path):
         """If the final rename (.part → final) fails, the .part file must be removed."""
         tmp_file = str(tmp_path / "src.tmp")
@@ -391,10 +430,10 @@ class TestGenerateOne:
         pbar = MagicMock()
         return lock, pbar
 
-    def test_generates_file_and_updates_state(self, config, state, mock_rucio):
+    def test_generates_file_and_updates_state(self, config, state, mock_rucio, writer):
         state.allocate(_state_key(0))
         lock, pbar = self._make_progress()
-        result = _generate_one(0, config, state, mock_rucio, lock, pbar)
+        result = _generate_one(0, config, state, mock_rucio, writer, lock, pbar)
 
         assert result["key"] == "file_000000"
         assert len(result["adler32"]) == 8
@@ -405,41 +444,41 @@ class TestGenerateOne:
         entry = state.get_file("file_000000")
         assert entry["status"] == FileStatus.CREATED
 
-    def test_lfn_name_includes_checksum(self, config, state, mock_rucio):
+    def test_lfn_name_includes_checksum(self, config, state, mock_rucio, writer):
         state.allocate(_state_key(0))
         lock, pbar = self._make_progress()
-        result = _generate_one(0, config, state, mock_rucio, lock, pbar)
+        result = _generate_one(0, config, state, mock_rucio, writer, lock, pbar)
         # LFN name format: {prefix}_{8-char-hex}
         parts = result["lfn_name"].rsplit("_", 1)
         assert parts[0] == config.file_prefix
         assert len(parts[1]) == 8
         assert parts[1] == result["adler32"]
 
-    def test_no_temp_file_left_after_success(self, config, state, mock_rucio, rse_mount):
+    def test_no_temp_file_left_after_success(self, config, state, mock_rucio, writer, rse_mount):
         state.allocate(_state_key(0))
         lock, pbar = self._make_progress()
-        _generate_one(0, config, state, mock_rucio, lock, pbar)
+        _generate_one(0, config, state, mock_rucio, writer, lock, pbar)
         tmp_dir = os.path.join(rse_mount, ".gen_tmp")
         if os.path.exists(tmp_dir):
             assert not any(f.endswith(".tmp") for f in os.listdir(tmp_dir) if ".tmp." in f)
 
-    def test_failure_marks_state_failed_creation(self, config, state, rse_mount):
+    def test_failure_marks_state_failed_creation(self, config, state, writer, rse_mount):
         state.allocate(_state_key(0))
         bad_rucio = MagicMock()
         bad_rucio.lfns2pfn.side_effect = RuntimeError("network down")
         lock, pbar = self._make_progress()
 
         with pytest.raises(RuntimeError, match="network down"):
-            _generate_one(0, config, state, bad_rucio, lock, pbar)
+            _generate_one(0, config, state, bad_rucio, writer, lock, pbar)
 
         entry = state.get_file("file_000000")
         assert entry["status"] == FileStatus.FAILED_CREATION
 
-    def test_dry_run_does_not_write_files(self, config, state, mock_rucio, rse_mount):
+    def test_dry_run_does_not_write_files(self, config, state, mock_rucio, writer, rse_mount):
         config.dry_run = True
         state.allocate(_state_key(0))
         lock, pbar = self._make_progress()
-        result = _generate_one(0, config, state, mock_rucio, lock, pbar)
+        result = _generate_one(0, config, state, mock_rucio, writer, lock, pbar)
 
         # No physical file should exist
         assert not os.path.exists(result["pfn"])

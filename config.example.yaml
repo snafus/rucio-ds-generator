@@ -100,5 +100,23 @@ rule_lifetime: ~
 # Default: ~/.rucio-ds-generator/registry.json
 # registry_file: ~/.rucio-ds-generator/registry.json
 
+# File-generation back-end.
+# csprng (default): streaming pseudo-random data via the fastest available stdlib
+#   PRNG (random.randbytes on Python 3.9+, os.urandom on 3.6-3.8).  PRNG-limited.
+# buffer-reuse: pre-fills a fixed ring buffer with random data once at startup.
+#   Each chunk write picks a random start offset in the ring — no PRNG per chunk.
+#   Write throughput becomes disk/memory-bandwidth-limited rather than PRNG-limited.
+#   Configure the ring size with buffer_reuse_ring_size below.
+# generation_mode: csprng
+
+# Ring buffer size for buffer-reuse mode.
+# Accepts a raw integer (bytes) or a human-readable string.
+# Must be >= 128 MiB (the chunk size).  Larger values provide greater data variety.
+# Peak RSS during buffer-reuse construction ≈ 2 × ring size.
+# SI units (decimal):  KB = 10³, MB = 10⁶, GB = 10⁹
+# IEC units (binary): KiB = 1024, MiB = 1024², GiB = 1024³
+# Examples: 512MiB (default), 1GiB, 2GiB
+# buffer_reuse_ring_size: 512MiB
+
 # Logging level: DEBUG, INFO, WARNING, ERROR
 log_level: "INFO"

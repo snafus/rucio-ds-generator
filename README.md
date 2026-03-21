@@ -255,6 +255,21 @@ rule_lifetime: ~          # Rule lifetime in seconds; null = permanent
 # Global dataset registry file. Default: ~/.rucio-ds-generator/registry.json
 # Set to empty string to disable.
 # registry_file: ~/.rucio-ds-generator/registry.json
+
+# File-generation back-end.
+# csprng (default): streaming pseudo-random data — fastest available stdlib
+#   PRNG (random.randbytes on Python 3.9+, os.urandom on 3.6-3.8).
+# buffer-reuse: pre-fills a fixed ring buffer with random data once at startup.
+#   Each chunk write reads from a random offset in the ring with no further
+#   PRNG calls, shifting the bottleneck from PRNG throughput to disk bandwidth.
+#   Configure the ring size with buffer_reuse_ring_size.
+# generation_mode: csprng
+
+# Ring buffer size for buffer-reuse mode.
+# Accepts a raw integer (bytes) or human-readable string (same units as file_size_bytes).
+# Must be >= 128 MiB (the write chunk size). Peak RSS during construction ≈ 2 × ring size.
+# Default: 512MiB. Larger values provide greater data variety across files.
+# buffer_reuse_ring_size: 512MiB
 ```
 
 Any YAML value can be overridden on the command line — see
@@ -519,7 +534,7 @@ pip install pytest-cov
 pytest --cov=dataset_generator --cov-report=term-missing
 ```
 
-The suite currently contains **211 tests** across five files:
+The suite currently contains **252 tests** across six files:
 
 | File | What it covers |
 |------|---------------|
@@ -528,6 +543,7 @@ The suite currently contains **211 tests** across five files:
 | `tests/test_generator.py` | File write, adler32 correctness, atomic rename, Pool A, resume |
 | `tests/test_rucio_client.py` | OIDC token lifecycle, retry logic, all Rucio API calls, container ops |
 | `tests/test_registry.py` | Registry upsert, persistence, thread safety, atomic write |
+| `tests/test_writers.py` | FileWriter ABC, CsprngFileWriter, BufferReuseFileWriter, factory |
 
 All tests run in under ten seconds. No network access or RSE mount is required.
 
@@ -575,6 +591,12 @@ Config overrides (all settable in YAML; CLI wins):
   --rse-uid UID          uid for placed files and newly created RSE directories
   --rse-gid GID          gid for placed files and newly created RSE directories
   --container-name NAME  Rucio container to attach the dataset to after each run
+  --generation-mode MODE File-generation back-end: csprng (default) or buffer-reuse.
+                         buffer-reuse pre-fills a ring with random data; writes become
+                         disk/memory-bandwidth-limited rather than PRNG-limited.
+  --buffer-reuse-ring-size SIZE
+                         Ring buffer size for buffer-reuse mode (default: 512MiB).
+                         Same unit syntax as --file-size-bytes. Must be >= 128 MiB.
   --registry-file PATH   Global registry JSON path (default: ~/.rucio-ds-generator/registry.json;
                          set to "" to disable)
   --rucio-host           Rucio server URL
