@@ -6,34 +6,37 @@ on the POSIX-mounted RSE storage and recording their state.
 
 File generation pipeline (per file)
 -------------------------------------
-1. Write random data to a temp path in ``staging_dir`` using 128 MiB chunks.
-   The adler32 checksum is accumulated incrementally — the full file is never
-   held in memory.  ``staging_dir`` may be on a different filesystem from the
-   RSE mount.
-2. Compute the final LFN name: ``{file_prefix}_{adler32_hex}`` where
-   ``adler32_hex`` is the checksum formatted as 8-char lowercase hex.
-3. Call ``RucioManager.lfns2pfn`` to resolve the canonical PFN for the LFN.
-   Translate it to the local filesystem path via ``_pfn_to_local`` (strips
-   any ``rse_pfn_prefix`` and prepends ``rse_mount``).
-4. Create parent (hash) directories of the local PFN (``_makedirs_chown``).
-5. Move the staged file to a ``.part`` temp name *on the RSE filesystem*:
-   - If staging and RSE are on the same filesystem: ``os.rename`` (instant).
-   - If cross-filesystem: ``shutil.copy2`` then ``os.unlink`` the staged copy.
-6. Set ownership (uid/gid) on the ``.part`` file while it still has a
-   temporary name — ownership is preserved across the final rename.
-7. Atomically rename ``.part`` → final PFN path (``os.rename``).  Both names
-   are on the RSE filesystem so this rename is always atomic.
-8. Update the state entry to ``FileStatus.CREATED``.
+1. A worker process writes random data to a temp path in ``staging_dir``
+   using 128 MiB chunks.  The adler32 checksum is accumulated
+   incrementally — the full file is never held in memory.
+2. The worker returns ``(idx, staging_path, checksum_hex, bytes_written)``
+   to the main process via ``multiprocessing.Pool.imap_unordered``.
+3. The main process derives the LFN: ``{file_prefix}_{adler32_hex}``.
+4. The main process calls ``RucioManager.lfns2pfn`` to resolve the
+   canonical PFN and translates it to a local filesystem path via
+   ``_pfn_to_local``.
+5. The main process creates parent (hash) directories and calls
+   ``_place_file`` to move the staged file atomically to its final RSE
+   location.
+6. The main process updates the state entry to ``FileStatus.CREATED``.
 
-Threading model
----------------
-Pool A (``--threads``, default 4) is used for file generation.  This pool
-is CPU/IO bound (``FileWriter.write_file`` + staging I/O).  A separate Pool B (in
-``rucio_client`` / ``__main__``) handles network-bound Rucio API calls.
+Process model (Pool A)
+-----------------------
+``multiprocessing.Pool`` (``--threads`` processes, default 4) is used for
+file generation.  Each worker process has its own Python interpreter and
+its own GIL, so ``random.randbytes`` / ``os.urandom`` run in true parallel.
+The pool is initialised via ``_worker_init`` which:
 
-Each thread pre-allocates its state entry at submission time, before any
-I/O begins.  On failure the entry is updated to ``FileStatus.FAILED_CREATION``
-so that a subsequent resume run can retry it.
+* Re-seeds the PRNG after ``fork`` so worker processes diverge from the
+  parent's MT19937 state (without this all workers would generate
+  identical bytes and thus identical checksums / LFN collisions).
+* Constructs a ``FileWriter`` once per worker, avoiding re-pickling a
+  large ring buffer on every task submission.
+* Routes log records through a ``multiprocessing.Queue`` to a
+  ``QueueListener`` in the main process (safe cross-process logging).
+
+State and Rucio access stay in the main process — worker tasks return
+plain data; the main process performs all state mutations and Rucio calls.
 
 Dry-run behaviour
 -----------------
@@ -52,10 +55,12 @@ result portable and matches what Rucio expects.
 
 import errno
 import logging
+import logging.handlers
+import multiprocessing
 import os
+import random
 import shutil
 import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Optional
 
 from tqdm import tqdm
@@ -64,6 +69,17 @@ from .state import FileStatus, StateFile
 from .writers import FileWriter, get_file_writer
 
 log = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Per-process worker state — set by _worker_init, reused across all tasks
+# ---------------------------------------------------------------------------
+
+#: Config instance for this worker process.  Set by ``_worker_init``.
+_proc_config = None   # type: Optional[object]
+
+#: FileWriter instance for this worker process.  Set by ``_worker_init``.
+_proc_writer = None   # type: Optional[FileWriter]
 
 
 # ---------------------------------------------------------------------------
@@ -76,117 +92,106 @@ def _state_key(idx):
     return "file_{:06d}".format(idx)
 
 
-def _generate_one(idx, config, state, rucio_manager, writer, progress_lock, progress_bar):
-    # type: (int, object, StateFile, object, FileWriter, threading.Lock, tqdm) -> dict
+def _worker_init(config, log_queue):
+    # type: (object, multiprocessing.Queue) -> None
     """
-    Generate a single file and update state.
+    Pool initialiser — runs once in each worker process before any tasks.
 
-    Called from Pool A worker threads.  Returns a dict with file metadata on
-    success; raises on unrecoverable error (state is set to FAILED_CREATION
-    before raising so the caller does not need to do so).
+    Sets up per-process logging (routes all records through *log_queue* to
+    the main process's ``QueueListener``), re-seeds the PRNG so forked
+    workers diverge from the parent's MT19937 state, and constructs a
+    ``FileWriter`` that is reused across all tasks in this process.
 
     Parameters
     ----------
-    idx:
-        Zero-based file index within this run.
     config:
-        ``Config`` instance.
-    state:
-        ``StateFile`` instance shared across all threads.
-    rucio_manager:
-        ``RucioManager`` instance — used for ``lfns2pfn`` only.
-    writer:
-        ``FileWriter`` instance used to write the file contents.  Shared
-        across all Pool A threads; must be thread-safe.
-    progress_lock:
-        Lock protecting writes to the ``tqdm`` progress bar from multiple
-        threads.
-    progress_bar:
-        ``tqdm`` instance for the overall generation progress.
+        ``Config`` instance (pickled from the parent process).
+    log_queue:
+        ``multiprocessing.Queue`` that the main process's ``QueueListener``
+        is draining.
     """
-    key = _state_key(idx)
-    thread_name = threading.current_thread().name
+    global _proc_config, _proc_writer
 
-    # config.staging_dir is a unique per-run temp dir created by main() before
-    # any generation starts.  It is guaranteed to exist and is exclusive to
-    # this invocation, so a simple index-based name is sufficient.
+    # Re-seed AFTER fork so each worker produces a distinct byte sequence.
+    # os.fork() copies the parent's MT19937 state verbatim; without this,
+    # every worker would generate identical bytes → identical checksums →
+    # LFN collisions.  random.seed() with no argument sources entropy from
+    # the OS, giving each process a unique seed.
+    random.seed()
+
+    # Route all log records from this worker to the main-process listener.
+    # Clears any inherited handlers to avoid double-logging or dead-locking
+    # on a file handler whose lock was held at fork time.
+    root = logging.getLogger()
+    root.handlers = []
+    root.addHandler(logging.handlers.QueueHandler(log_queue))
+    root.setLevel(logging.DEBUG)
+
+    _proc_config = config
+    # Construct the FileWriter once per process.  For BufferReuseFileWriter
+    # this allocates the ring buffer here (after re-seeding), giving each
+    # worker a differently-seeded, independently-owned buffer.
+    _proc_writer = get_file_writer(config.generation_mode, config)
+
+    pname = multiprocessing.current_process().name
+    log.info("[%s] Worker ready (pid=%d): %s",
+             pname, os.getpid(), _proc_writer.description)
+
+
+def _write_one_worker(idx):
+    # type: (int) -> tuple
+    """
+    Worker task: write one file to the staging directory.
+
+    Called by ``multiprocessing.Pool.imap_unordered`` in a worker process.
+    Uses the module-level ``_proc_config`` and ``_proc_writer`` set by
+    ``_worker_init``.
+
+    Never raises — failures are returned as the fifth tuple element so
+    the main-process result loop handles them uniformly.
+
+    Returns
+    -------
+    tuple
+        ``(idx, staging_path, checksum_hex, bytes_written, None)`` on
+        success.  ``(idx, None, None, None, error_message)`` on failure
+        (any partial staging file has already been cleaned up).
+    """
+    global _proc_config, _proc_writer
+    config = _proc_config
+    writer = _proc_writer
+    pname = multiprocessing.current_process().name
+
     staging_dir = config.staging_dir
     tmp_name = "{}.tmp.{:06d}".format(config.file_prefix, idx)
     tmp_path = os.path.join(staging_dir, tmp_name)
 
-    log.debug("[%s|file-%06d] Starting generation: staging=%s size=%d",
-              thread_name, idx, staging_dir, config.file_size_bytes)
+    log.debug("[%s|file-%06d] Starting write: staging=%s size=%d",
+              pname, idx, staging_dir, config.file_size_bytes)
 
     try:
         if config.dry_run:
-            checksum_val = 0xDEADBEEF & 0xFFFFFFFF
+            checksum_hex = format(0xDEADBEEF & 0xFFFFFFFF, "08x")
             bytes_written = config.file_size_bytes
-            log.debug("[%s|file-%06d] dry-run: skipping write", thread_name, idx)
+            log.debug("[%s|file-%06d] dry-run: skipping write", pname, idx)
         else:
-            log.debug("[%s|file-%06d] Writing to staging: %s", thread_name, idx, tmp_path)
+            log.debug("[%s|file-%06d] Writing to staging: %s", pname, idx, tmp_path)
             checksum_val, bytes_written = writer.write_file(tmp_path, config.file_size_bytes)
-            log.debug("[%s|file-%06d] Write complete: %d bytes, adler32=%08x",
-                      thread_name, idx, bytes_written, checksum_val)
+            checksum_hex = format(checksum_val, "08x")
+            log.debug("[%s|file-%06d] Write complete: %d bytes, adler32=%s",
+                      pname, idx, bytes_written, checksum_hex)
 
-        checksum_hex = format(checksum_val, "08x")
-        lfn_name = "{}_{}".format(config.file_prefix, checksum_hex)
-        lfn = "{}:{}".format(config.scope, lfn_name)
-
-        log.debug("[%s|file-%06d] LFN: %s (adler32=%s)", thread_name, idx, lfn, checksum_hex)
-
-        # Resolve Rucio PFN, then translate to local filesystem path.
-        if config.dry_run:
-            local_pfn = os.path.join(config.rse_mount, config.scope, lfn_name)
-            log.debug("[%s|file-%06d] dry-run: synthetic pfn=%s", thread_name, idx, local_pfn)
-        else:
-            log.debug("[%s|file-%06d] Resolving PFN for rse=%s lfn=%s",
-                      thread_name, idx, config.rse, lfn)
-            rucio_pfn = rucio_manager.lfns2pfn(config.rse, lfn)
-            local_pfn = _pfn_to_local(rucio_pfn, config.rse_pfn_prefix, config.rse_mount)
-            log.debug("[%s|file-%06d] PFN resolved: rucio=%s local=%s",
-                      thread_name, idx, rucio_pfn, local_pfn)
-
-        if not config.dry_run:
-            log.debug("[%s|file-%06d] Placing file: %s → %s",
-                      thread_name, idx, tmp_path, local_pfn)
-            _place_file(tmp_path, local_pfn, uid=config.rse_uid, gid=config.rse_gid)
-            log.debug("[%s|file-%06d] Placement complete: %s", thread_name, idx, local_pfn)
-
-        state.update(
-            key,
-            status=FileStatus.CREATED,
-            lfn=lfn,
-            lfn_name=lfn_name,
-            pfn=local_pfn,
-            bytes=bytes_written,
-            adler32=checksum_hex,
-        )
-
-        log.info("[file-%06d] Created: %s (%d bytes, adler32=%s)",
-                 idx, lfn, bytes_written, checksum_hex)
-
-        with progress_lock:
-            progress_bar.update(1)
-
-        return {
-            "key": key,
-            "lfn": lfn,
-            "lfn_name": lfn_name,
-            "pfn": local_pfn,
-            "bytes": bytes_written,
-            "adler32": checksum_hex,
-        }
+        return (idx, tmp_path, checksum_hex, bytes_written, None)
 
     except Exception as exc:
-        log.error("[%s|file-%06d] Generation failed: %s", thread_name, idx, exc)
-        # Best-effort cleanup of any partial staging file
+        log.error("[%s|file-%06d] Write failed: %s", pname, idx, exc)
+        # Best-effort cleanup of any partial staging file.
         try:
             if not config.dry_run and os.path.exists(tmp_path):
                 os.unlink(tmp_path)
         except OSError:
             pass
-        state.update(key, status=FileStatus.FAILED_CREATION)
-        raise
+        return (idx, None, None, None, str(exc))
 
 
 def _makedirs_chown(path, uid, gid):
@@ -377,11 +382,15 @@ def _place_file(staging_path, local_pfn, uid=None, gid=None):
 def run_generation(config, state, rucio_manager, new_count=None):
     # type: (object, StateFile, object, Optional[int]) -> List[dict]
     """
-    Generate files for this run using Pool A (``config.threads`` threads).
+    Generate files for this run using Pool A (``config.threads`` processes).
 
     Files whose state entry is already ``CREATED``, ``REGISTERED``, or
     ``RULED`` are skipped.  Files in ``FAILED_CREATION`` (or ``PENDING``) are
     (re-)generated.
+
+    Worker processes handle file writing only.  PFN resolution, file
+    placement, and state updates are performed in the main process as
+    results arrive via ``imap_unordered``.
 
     Parameters
     ----------
@@ -390,7 +399,7 @@ def run_generation(config, state, rucio_manager, new_count=None):
     state:
         ``StateFile`` instance (already loaded or created by ``__main__``).
     rucio_manager:
-        ``RucioManager`` instance for ``lfns2pfn`` calls.
+        ``RucioManager`` instance for ``lfns2pfn`` calls (main process only).
     new_count:
         Number of *additional* files to generate beyond those already tracked
         in the state file.  The total managed by this call is
@@ -404,12 +413,8 @@ def run_generation(config, state, rucio_manager, new_count=None):
         those that were already in ``CREATED`` state from a prior run).
     """
     if new_count is None:
-        # Default: manage exactly config.num_files entries total (original
-        # behaviour — the caller has not told us about pre-existing Rucio files).
         total = config.num_files
     else:
-        # Additive: caller has computed how many *additional* files are needed
-        # on top of what the state file already tracks.
         total = state.count() + new_count
 
     # Pre-allocate state entries for all expected files so resume logic works.
@@ -435,44 +440,127 @@ def run_generation(config, state, rucio_manager, new_count=None):
         return already_done
 
     log.info(
-        "Generating %d file(s) using %d thread(s) [%d already done]",
+        "Generating %d file(s) using %d process(es) [%d already done]",
         len(to_generate), config.threads, len(already_done),
     )
 
-    writer = get_file_writer(config.generation_mode, config)
-    log.info("File writer: %s", writer.description)
+    # Pre-render the file_prefix Jinja2 template in the main process so all
+    # workers receive a frozen, consistent value in the pickled Config.
+    _ = config.file_prefix
 
     results = list(already_done)
     failures = []
 
-    progress_lock = threading.Lock()
-    with tqdm(
-        total=total,
-        initial=len(already_done),
-        unit="file",
-        desc="Generating",
-        dynamic_ncols=True,
-    ) as pbar:
-        with ThreadPoolExecutor(
-            max_workers=config.threads,
-            thread_name_prefix="gen",
-        ) as pool:
-            futures = {
-                pool.submit(
-                    _generate_one,
-                    idx, config, state, rucio_manager, writer, progress_lock, pbar,
-                ): idx
-                for idx in to_generate
-            }
+    # Set up cross-process logging: worker records are queued here and
+    # emitted by the listener in the main process.
+    log_queue = multiprocessing.Queue()  # type: ignore
+    root_handlers = logging.getLogger().handlers[:]
+    if not root_handlers:
+        root_handlers = [logging.StreamHandler()]
+    listener = logging.handlers.QueueListener(
+        log_queue, *root_handlers, respect_handler_level=True
+    )
+    listener.start()
 
-            for future in as_completed(futures):
-                idx = futures[future]
-                try:
-                    result = future.result()
-                    results.append(result)
-                except Exception as exc:
-                    log.error("File index %d failed permanently: %s", idx, exc)
+    pool = multiprocessing.Pool(
+        processes=config.threads,
+        initializer=_worker_init,
+        initargs=(config, log_queue),
+    )
+
+    try:
+        with tqdm(
+            total=total,
+            initial=len(already_done),
+            unit="file",
+            desc="Generating",
+            dynamic_ncols=True,
+        ) as pbar:
+            for result_tuple in pool.imap_unordered(_write_one_worker, to_generate):
+                idx, staging_path, checksum_hex, bytes_written, error_str = result_tuple
+                key = _state_key(idx)
+
+                if error_str is not None:
+                    log.error("[file-%06d] Write failed: %s", idx, error_str)
+                    state.update(key, status=FileStatus.FAILED_CREATION)
                     failures.append(idx)
+                    pbar.update(1)
+                    continue
+
+                # Post-write: PFN resolution, placement, and state update
+                # run in the main process where rucio_manager lives.
+                try:
+                    lfn_name = "{}_{}".format(config.file_prefix, checksum_hex)
+                    lfn = "{}:{}".format(config.scope, lfn_name)
+
+                    if config.dry_run:
+                        local_pfn = os.path.join(
+                            config.rse_mount, config.scope, lfn_name
+                        )
+                        log.debug("[file-%06d] dry-run: synthetic pfn=%s", idx, local_pfn)
+                    else:
+                        log.debug("[file-%06d] Resolving PFN: rse=%s lfn=%s",
+                                  idx, config.rse, lfn)
+                        rucio_pfn = rucio_manager.lfns2pfn(config.rse, lfn)
+                        local_pfn = _pfn_to_local(
+                            rucio_pfn, config.rse_pfn_prefix, config.rse_mount
+                        )
+                        log.debug("[file-%06d] PFN resolved: rucio=%s local=%s",
+                                  idx, rucio_pfn, local_pfn)
+                        log.debug("[file-%06d] Placing file: %s → %s",
+                                  idx, staging_path, local_pfn)
+                        _place_file(
+                            staging_path, local_pfn,
+                            uid=config.rse_uid, gid=config.rse_gid,
+                        )
+                        log.debug("[file-%06d] Placement complete: %s", idx, local_pfn)
+
+                    state.update(
+                        key,
+                        status=FileStatus.CREATED,
+                        lfn=lfn,
+                        lfn_name=lfn_name,
+                        pfn=local_pfn,
+                        bytes=bytes_written,
+                        adler32=checksum_hex,
+                    )
+
+                    result = {
+                        "key": key,
+                        "lfn": lfn,
+                        "lfn_name": lfn_name,
+                        "pfn": local_pfn,
+                        "bytes": bytes_written,
+                        "adler32": checksum_hex,
+                    }
+                    results.append(result)
+                    log.info("[file-%06d] Created: %s (%d bytes, adler32=%s)",
+                             idx, lfn, bytes_written, checksum_hex)
+                    pbar.update(1)
+
+                except Exception as exc:
+                    log.error("[file-%06d] Post-write processing failed: %s", idx, exc)
+                    # Clean up staging file the worker left behind.
+                    try:
+                        if staging_path and not config.dry_run \
+                                and os.path.exists(staging_path):
+                            os.unlink(staging_path)
+                    except OSError:
+                        pass
+                    state.update(key, status=FileStatus.FAILED_CREATION)
+                    failures.append(idx)
+                    pbar.update(1)
+
+        pool.close()
+
+    except KeyboardInterrupt:
+        log.warning("Interrupted — terminating worker pool")
+        pool.terminate()
+        raise
+
+    finally:
+        pool.join()
+        listener.stop()
 
     if failures:
         log.warning(
