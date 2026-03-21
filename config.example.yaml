@@ -1,0 +1,42 @@
+# Example configuration for claude-dataset-generator
+# CLI arguments override any value set here.
+
+# Rucio scope for all DIDs
+scope: "cms"
+
+# RSE name to place files on (must be POSIX-mounted on this host)
+rse: "T2_US_EXAMPLE"
+
+# POSIX path to the RSE storage root on this host
+rse_mount: "/mnt/rse/T2_US_EXAMPLE"
+
+# Dataset DID prefix — final name: {dataset_prefix}_{date}_{run_id}
+dataset_prefix: "testdataset"
+
+# File LFN prefix — final filename: {prefix}_{adler32hex}
+file_prefix: "testfile"
+
+# Number of files to generate per run
+num_files: 10
+
+# Size of each generated file in bytes (e.g. 1 GiB)
+file_size_bytes: 1073741824
+
+# OIDC client credentials
+token_endpoint: "https://iam.example.org/token"
+client_id: "my-client-id"
+client_secret: "my-client-secret"
+
+# Rucio server URL
+rucio_host: "https://rucio.example.org"
+rucio_auth_host: "https://rucio-auth.example.org"
+
+# Pool A: file generation thread count (CPU/IO bound)
+threads: 4
+
+# Replication rule lifetime in seconds. Omit or set to null for a permanent rule.
+# Examples: 604800 = 7 days, 2592000 = 30 days
+rule_lifetime: ~
+
+# Logging level: DEBUG, INFO, WARNING, ERROR
+log_level: "INFO"

@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=42", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "claude-dataset-generator"
+version = "0.1.0"
+description = "Generate dummy test datasets and register them into Rucio"
+requires-python = ">=3.6"
+dependencies = [
+    "rucio-clients",
+    "PyYAML",
+    "tqdm",
+    "requests",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "flake8",
+    "black",
+    "isort",
+    "mypy",
+]
+
+[project.scripts]
+dataset-generator = "dataset_generator.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
