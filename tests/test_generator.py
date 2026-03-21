@@ -309,7 +309,7 @@ class TestPlaceFile:
             assert fh.read() == b"crossfs"
 
     def test_part_file_cleaned_up_on_crossfs_copy_failure(self, tmp_path):
-        """If shutil.copy2 fails on a cross-filesystem move, the partial .part must be removed."""
+        """If the cross-filesystem copy fails, the partial .part must be removed."""
         tmp_file = str(tmp_path / "src.tmp")
         with open(tmp_file, "wb") as fh:
             fh.write(b"data")
@@ -326,7 +326,8 @@ class TestPlaceFile:
             return real_rename(src, dst)
 
         with patch("os.rename", side_effect=patched_rename):
-            with patch("shutil.copy2", side_effect=OSError("disk full")):
+            with patch("dataset_generator.generator._copy_file_fast",
+                       side_effect=OSError("disk full")):
                 with pytest.raises(OSError, match="disk full"):
                     _place_file(tmp_file, final)
 

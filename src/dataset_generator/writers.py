@@ -168,8 +168,27 @@ class CsprngFileWriter(FileWriter):
     to avoid the ``BufferedWriter`` memcpy overhead.  ``os.posix_fallocate``
     pre-allocates the file extent where supported.
 
-    Thread-safe: no mutable instance state.
+    Thread-safe: all instance state is immutable after construction.
+
+    Parameters
+    ----------
+    use_fallocate:
+        Enable ``posix_fallocate`` pre-allocation.  Set to ``False`` on
+        CephFS, where fallocate may write zeros instead of reserving space
+        (making it as slow as a regular write with no benefit).  The flag
+        is silently forced to ``False`` on platforms without the syscall.
     """
+
+    def __init__(self, use_fallocate=True):
+        # type: (bool) -> None
+        # True only if the OS supports fallocate AND the caller has enabled it.
+        self._use_fallocate = use_fallocate and _HAS_FALLOCATE
+
+    @classmethod
+    def from_config(cls, config):
+        # type: (Any) -> CsprngFileWriter
+        use_fallocate = getattr(config, "fallocate", True) if config is not None else True
+        return cls(use_fallocate=use_fallocate)
 
     @property
     def description(self):
@@ -177,7 +196,7 @@ class CsprngFileWriter(FileWriter):
         return "csprng | {} | chunk: {} MiB | fallocate: {}".format(
             _RAND_METHOD,
             CHUNK_SIZE // (1024 * 1024),
-            "yes" if _HAS_FALLOCATE else "no",
+            "yes" if self._use_fallocate else "no",
         )
 
     def write_file(self, path, size_bytes):
@@ -203,7 +222,7 @@ class CsprngFileWriter(FileWriter):
             # Pre-allocate full extent; silently ignored if unsupported.
             # NOTE: posix_fallocate extends the file to size_bytes immediately,
             # so 'ls -la' will show the final file size before data is written.
-            if _HAS_FALLOCATE:
+            if self._use_fallocate:
                 try:
                     os.posix_fallocate(fd, 0, size_bytes)
                     log.debug("[%s] fallocate: ok (%d bytes)", tname, size_bytes)
@@ -281,11 +300,13 @@ class BufferReuseFileWriter(FileWriter):
     Any start offset ``s`` in ``[0, ring_size)`` yields a valid contiguous
     slice ``extended[s : s + chunk_size]``.
 
-    Memory
-    ------
+    Memory (per process)
+    --------------------
     Peak RSS during construction ≈ 2 × ring_size (original random bytes +
     extended buffer).  After construction only ``ring_size + CHUNK_SIZE``
-    bytes are retained.
+    bytes are retained.  With N worker processes (``--threads N``) using
+    ``buffer-reuse`` mode, total RSS ≈ N × (ring_size + 128 MiB).  At the
+    default 512 MiB ring and 4 workers that is ≈ 2.5 GiB.
 
     Thread safety
     -------------
@@ -298,10 +319,14 @@ class BufferReuseFileWriter(FileWriter):
     ring_size:
         Size of the random ring in bytes.  Must be >= ``CHUNK_SIZE``
         (128 MiB).  Larger values provide greater data variety across chunks.
+    use_fallocate:
+        Enable ``posix_fallocate`` pre-allocation.  Set to ``False`` on
+        CephFS, where fallocate may write zeros instead of reserving space.
+        Silently forced to ``False`` on platforms without the syscall.
     """
 
-    def __init__(self, ring_size=_DEFAULT_RING_SIZE):
-        # type: (int) -> None
+    def __init__(self, ring_size=_DEFAULT_RING_SIZE, use_fallocate=True):
+        # type: (int, bool) -> None
         if ring_size < _MIN_RING_SIZE:
             raise ValueError(
                 "buffer_reuse_ring_size ({} bytes) must be >= CHUNK_SIZE "
@@ -310,6 +335,7 @@ class BufferReuseFileWriter(FileWriter):
                 )
             )
         self._ring_size = ring_size
+        self._use_fallocate = use_fallocate and _HAS_FALLOCATE
 
         # Fill ring with random data, then extend by CHUNK_SIZE bytes
         # (duplicate the ring's start) so every chunk access is contiguous.
@@ -325,7 +351,8 @@ class BufferReuseFileWriter(FileWriter):
             if config is not None
             else _DEFAULT_RING_SIZE
         )
-        return cls(ring_size=ring_size)
+        use_fallocate = getattr(config, "fallocate", True) if config is not None else True
+        return cls(ring_size=ring_size, use_fallocate=use_fallocate)
 
     @property
     def description(self):
@@ -334,7 +361,7 @@ class BufferReuseFileWriter(FileWriter):
             "buffer-reuse | ring: {} MiB | chunk: {} MiB | fallocate: {}".format(
                 self._ring_size // (1024 * 1024),
                 CHUNK_SIZE // (1024 * 1024),
-                "yes" if _HAS_FALLOCATE else "no",
+                "yes" if self._use_fallocate else "no",
             )
         )
 
@@ -360,7 +387,7 @@ class BufferReuseFileWriter(FileWriter):
 
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o666)
         try:
-            if _HAS_FALLOCATE:
+            if self._use_fallocate:
                 try:
                     os.posix_fallocate(fd, 0, size_bytes)
                     log.debug("[%s] fallocate: ok (%d bytes)", tname, size_bytes)

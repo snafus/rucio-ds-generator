@@ -112,11 +112,19 @@ rule_lifetime: ~
 # Ring buffer size for buffer-reuse mode.
 # Accepts a raw integer (bytes) or a human-readable string.
 # Must be >= 128 MiB (the chunk size).  Larger values provide greater data variety.
-# Peak RSS during buffer-reuse construction ≈ 2 × ring size.
+# Memory footprint: N workers × (ring_size + 128 MiB).  At 4 workers + 512 MiB ≈ 2.5 GiB.
 # SI units (decimal):  KB = 10³, MB = 10⁶, GB = 10⁹
 # IEC units (binary): KiB = 1024, MiB = 1024², GiB = 1024³
 # Examples: 512MiB (default), 1GiB, 2GiB
 # buffer_reuse_ring_size: 512MiB
+
+# posix_fallocate pre-allocation.  Default: true (enabled).
+# Disable on CephFS: on CephFS fallocate writes zeros to disk rather than
+# simply reserving space, making it as slow as a regular write with no
+# benefit.  On ext4/XFS fallocate is near-instant and eliminates
+# extent-allocation overhead during sequential writes.
+# fallocate: true
+# fallocate: false  # use this on CephFS
 
 # Logging level: DEBUG, INFO, WARNING, ERROR
 log_level: "INFO"

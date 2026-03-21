@@ -59,8 +59,8 @@ import logging.handlers
 import multiprocessing
 import os
 import random
-import shutil
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from typing import List, Optional
 
 from tqdm import tqdm
@@ -128,9 +128,10 @@ def _worker_init(config, log_queue):
     root.setLevel(logging.DEBUG)
 
     _proc_config = config
-    # Construct the FileWriter once per process.  For BufferReuseFileWriter
-    # this allocates the ring buffer here (after re-seeding), giving each
-    # worker a differently-seeded, independently-owned buffer.
+    # IMPORTANT: random.seed() above MUST be called before get_file_writer()
+    # below.  BufferReuseFileWriter fills its ring buffer with _randbytes()
+    # during __init__, so the seed must be in place before construction to
+    # guarantee each worker fills its ring with a distinct byte sequence.
     _proc_writer = get_file_writer(config.generation_mode, config)
 
     pname = multiprocessing.current_process().name
@@ -224,6 +225,9 @@ def _makedirs_chown(path, uid, gid):
             break
         current = parent
 
+    # exist_ok=True handles EEXIST races when multiple placement threads
+    # create the same hash directory concurrently (common on CephFS where
+    # metadata ops have higher latency than on local filesystems).
     os.makedirs(path, exist_ok=True)
 
     if uid is not None or gid is not None:
@@ -292,6 +296,47 @@ def _pfn_to_local(pfn, rse_pfn_prefix, rse_mount):
     return pfn
 
 
+#: Buffer size for the fallback cross-filesystem copy loop.
+#: shutil.copy2 uses 16 KiB on Python 3.6 — 512× fewer syscalls at 8 MiB.
+_COPY_BUFSIZE = 8 * 1024 * 1024   # 8 MiB
+
+
+def _copy_file_fast(src, dst):
+    # type: (str, str) -> None
+    """
+    Copy *src* to *dst* using the fastest available method.
+
+    Prefers ``os.sendfile`` (Linux/macOS, Python 3.3+) which performs a
+    kernel-level copy that releases the GIL and avoids user-space buffering.
+    Falls back to an 8 MiB read/write loop on platforms without sendfile —
+    ``shutil.copy2`` uses only 16 KiB on Python 3.6, making it 512× slower
+    per syscall pair for large files.
+
+    Only file data is copied; metadata (timestamps, xattrs) is not transferred.
+    The caller (``_place_file``) handles ownership separately via ``os.chown``.
+    """
+    with open(src, "rb") as fsrc:
+        with open(dst, "wb") as fdst:
+            src_fd = fsrc.fileno()
+            dst_fd = fdst.fileno()
+            if hasattr(os, "sendfile"):
+                # sendfile(out_fd, in_fd, offset, count) — releases the GIL;
+                # performs a kernel-level copy on Linux with no user-space copy.
+                file_size = os.fstat(src_fd).st_size
+                offset = 0
+                while offset < file_size:
+                    sent = os.sendfile(dst_fd, src_fd, offset, file_size - offset)
+                    if sent == 0:
+                        break
+                    offset += sent
+            else:
+                while True:
+                    buf = fsrc.read(_COPY_BUFSIZE)
+                    if not buf:
+                        break
+                    fdst.write(buf)
+
+
 def _place_file(staging_path, local_pfn, uid=None, gid=None):
     # type: (str, str, Optional[int], Optional[int]) -> None
     """
@@ -339,11 +384,11 @@ def _place_file(staging_path, local_pfn, uid=None, gid=None):
             raise
         # Cross-filesystem: copy bytes then remove the staging copy.
         # Clean up any partial .part file if the copy fails (e.g. disk full).
-        log.debug("[%s] _place_file: EXDEV — falling back to copy2: %s → %s",
+        log.debug("[%s] _place_file: EXDEV — falling back to fast copy: %s → %s",
                   tname, staging_path, part_path)
         try:
-            shutil.copy2(staging_path, part_path)
-            log.debug("[%s] _place_file: copy2 ok", tname)
+            _copy_file_fast(staging_path, part_path)
+            log.debug("[%s] _place_file: fast copy ok", tname)
         except Exception:
             try:
                 os.unlink(part_path)
@@ -460,13 +505,24 @@ def run_generation(config, state, rucio_manager, new_count=None):
     listener = logging.handlers.QueueListener(
         log_queue, *root_handlers, respect_handler_level=True
     )
-    listener.start()
 
+    # Fix 2: Create the worker pool BEFORE starting the listener thread.
+    # os.fork() copies the parent's thread state verbatim; if the listener
+    # thread is alive at fork time its log-queue lock may be inherited in a
+    # locked state by the child, causing it to deadlock on its first log write.
     pool = multiprocessing.Pool(
         processes=config.threads,
         initializer=_worker_init,
         initargs=(config, log_queue),
     )
+    listener.start()   # All forks are done — safe to start the listener thread.
+
+    # Fix 5: Placement thread pool — one slot per generation worker so that
+    # file placements (I/O-bound: same-fs rename or cross-fs copy) overlap
+    # with the next write rather than serialising after each write result.
+    placement_executor = ThreadPoolExecutor(max_workers=config.threads)
+    # Maps future → (idx, staging_path, checksum_hex, bytes_written, lfn, lfn_name, local_pfn)
+    pending_placements = {}  # type: dict
 
     try:
         with tqdm(
@@ -476,6 +532,57 @@ def run_generation(config, state, rucio_manager, new_count=None):
             desc="Generating",
             dynamic_ncols=True,
         ) as pbar:
+            # -- Placement helpers (closures over pbar and shared state) ------
+
+            def _handle_placement_future(future):
+                # type: (object) -> None
+                """Collect one completed placement future; update state and pbar."""
+                (idx2, staging_path2, checksum_hex2,
+                 bytes_written2, lfn2, lfn_name2, local_pfn2) = pending_placements.pop(future)
+                key2 = _state_key(idx2)
+                try:
+                    future.result()   # re-raises any exception from _place_file
+                except Exception as exc:
+                    log.error("[file-%06d] Placement failed: %s", idx2, exc)
+                    # staging_path2 may still exist if step 1 of _place_file failed.
+                    try:
+                        if staging_path2 and os.path.exists(staging_path2):
+                            os.unlink(staging_path2)
+                    except OSError:
+                        pass
+                    state.update(key2, status=FileStatus.FAILED_CREATION)
+                    failures.append(idx2)
+                    pbar.update(1)
+                    return
+                state.update(
+                    key2,
+                    status=FileStatus.CREATED,
+                    lfn=lfn2,
+                    lfn_name=lfn_name2,
+                    pfn=local_pfn2,
+                    bytes=bytes_written2,
+                    adler32=checksum_hex2,
+                )
+                results.append({
+                    "key": key2,
+                    "lfn": lfn2,
+                    "lfn_name": lfn_name2,
+                    "pfn": local_pfn2,
+                    "bytes": bytes_written2,
+                    "adler32": checksum_hex2,
+                })
+                log.info("[file-%06d] Created: %s (%d bytes, adler32=%s)",
+                         idx2, lfn2, bytes_written2, checksum_hex2)
+                pbar.update(1)
+
+            def _collect_done_placements():
+                # type: () -> None
+                """Drain any already-completed placement futures without blocking."""
+                for future in [f for f in list(pending_placements) if f.done()]:
+                    _handle_placement_future(future)
+
+            # -- Main write/placement loop ------------------------------------
+
             for result_tuple in pool.imap_unordered(_write_one_worker, to_generate):
                 idx, staging_path, checksum_hex, bytes_written, error_str = result_tuple
                 key = _state_key(idx)
@@ -485,10 +592,12 @@ def run_generation(config, state, rucio_manager, new_count=None):
                     state.update(key, status=FileStatus.FAILED_CREATION)
                     failures.append(idx)
                     pbar.update(1)
+                    _collect_done_placements()
                     continue
 
-                # Post-write: PFN resolution, placement, and state update
-                # run in the main process where rucio_manager lives.
+                # Post-write: PFN resolution runs in the main process
+                # (rucio_manager lives here).  Placement is submitted to the
+                # placement thread pool so it overlaps with the next write.
                 try:
                     lfn_name = "{}_{}".format(config.file_prefix, checksum_hex)
                     lfn = "{}:{}".format(config.scope, lfn_name)
@@ -498,6 +607,26 @@ def run_generation(config, state, rucio_manager, new_count=None):
                             config.rse_mount, config.scope, lfn_name
                         )
                         log.debug("[file-%06d] dry-run: synthetic pfn=%s", idx, local_pfn)
+                        state.update(
+                            key,
+                            status=FileStatus.CREATED,
+                            lfn=lfn,
+                            lfn_name=lfn_name,
+                            pfn=local_pfn,
+                            bytes=bytes_written,
+                            adler32=checksum_hex,
+                        )
+                        results.append({
+                            "key": key,
+                            "lfn": lfn,
+                            "lfn_name": lfn_name,
+                            "pfn": local_pfn,
+                            "bytes": bytes_written,
+                            "adler32": checksum_hex,
+                        })
+                        log.info("[file-%06d] Created: %s (%d bytes, adler32=%s)",
+                                 idx, lfn, bytes_written, checksum_hex)
+                        pbar.update(1)
                     else:
                         log.debug("[file-%06d] Resolving PFN: rse=%s lfn=%s",
                                   idx, config.rse, lfn)
@@ -507,40 +636,20 @@ def run_generation(config, state, rucio_manager, new_count=None):
                         )
                         log.debug("[file-%06d] PFN resolved: rucio=%s local=%s",
                                   idx, rucio_pfn, local_pfn)
-                        log.debug("[file-%06d] Placing file: %s → %s",
+                        log.debug("[file-%06d] Submitting placement: %s → %s",
                                   idx, staging_path, local_pfn)
-                        _place_file(
-                            staging_path, local_pfn,
-                            uid=config.rse_uid, gid=config.rse_gid,
+                        future = placement_executor.submit(
+                            _place_file, staging_path, local_pfn,
+                            config.rse_uid, config.rse_gid,
                         )
-                        log.debug("[file-%06d] Placement complete: %s", idx, local_pfn)
-
-                    state.update(
-                        key,
-                        status=FileStatus.CREATED,
-                        lfn=lfn,
-                        lfn_name=lfn_name,
-                        pfn=local_pfn,
-                        bytes=bytes_written,
-                        adler32=checksum_hex,
-                    )
-
-                    result = {
-                        "key": key,
-                        "lfn": lfn,
-                        "lfn_name": lfn_name,
-                        "pfn": local_pfn,
-                        "bytes": bytes_written,
-                        "adler32": checksum_hex,
-                    }
-                    results.append(result)
-                    log.info("[file-%06d] Created: %s (%d bytes, adler32=%s)",
-                             idx, lfn, bytes_written, checksum_hex)
-                    pbar.update(1)
+                        pending_placements[future] = (
+                            idx, staging_path, checksum_hex,
+                            bytes_written, lfn, lfn_name, local_pfn,
+                        )
 
                 except Exception as exc:
                     log.error("[file-%06d] Post-write processing failed: %s", idx, exc)
-                    # Clean up staging file the worker left behind.
+                    # Clean up the staging file the worker left behind.
                     try:
                         if staging_path and not config.dry_run \
                                 and os.path.exists(staging_path):
@@ -551,15 +660,24 @@ def run_generation(config, state, rucio_manager, new_count=None):
                     failures.append(idx)
                     pbar.update(1)
 
+                # Collect any placements that finished while we processed
+                # this write result so the dict stays bounded.
+                _collect_done_placements()
+
+            # All writes finished; wait for any outstanding placements.
+            for future in list(pending_placements):
+                _handle_placement_future(future)
+
         pool.close()
 
-    except KeyboardInterrupt:
+    except BaseException:   # Fix 1: catches KeyboardInterrupt, SystemExit, etc.
         log.warning("Interrupted — terminating worker pool")
         pool.terminate()
         raise
 
     finally:
         pool.join()
+        placement_executor.shutdown(wait=False)   # futures already awaited above
         listener.stop()
 
     if failures:

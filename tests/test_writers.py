@@ -141,8 +141,11 @@ class TestCsprngFileWriter:
         assert 0 <= checksum <= 0xFFFFFFFF
 
     def test_thread_safe_no_shared_mutable_state(self, writer):
-        """CsprngFileWriter has no instance attributes — safe to share across threads."""
-        assert writer.__dict__ == {}
+        """CsprngFileWriter has only immutable instance state — safe to share across threads."""
+        # _use_fallocate is set once at construction and never mutated.
+        assert isinstance(writer._use_fallocate, bool)
+        # No other instance attributes should exist.
+        assert set(writer.__dict__.keys()) == {"_use_fallocate"}
 
 
 # ---------------------------------------------------------------------------
