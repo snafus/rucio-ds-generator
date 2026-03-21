@@ -196,6 +196,78 @@ class TestBufferReuseFileWriter:
         assert isinstance(writer._extended, memoryview)
 
 
+class TestConcurrentWrites:
+    """
+    Verify that a single FileWriter instance shared across threads produces
+    valid, independently checksummed files with no data corruption.
+    """
+
+    _N_THREADS = 4
+    _FILE_SIZE = 4096
+
+    def _run_concurrent(self, tmp_path, writer):
+        import threading
+        import zlib as _zlib
+
+        errors = []
+        results = {}
+        barrier = threading.Barrier(self._N_THREADS)
+
+        def worker(idx):
+            path = str(tmp_path / "f{}.dat".format(idx))
+            try:
+                barrier.wait()   # all threads start simultaneously
+                checksum, size = writer.write_file(path, self._FILE_SIZE)
+                with open(path, "rb") as fh:
+                    data = fh.read()
+                expected = _zlib.adler32(data, 1) & 0xFFFFFFFF
+                results[idx] = (checksum, size, expected)
+            except Exception as exc:
+                errors.append((idx, exc))
+
+        threads = [threading.Thread(target=worker, args=(i,))
+                   for i in range(self._N_THREADS)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        return errors, results
+
+    def test_csprng_concurrent_no_errors(self, tmp_path):
+        writer = CsprngFileWriter()
+        errors, results = self._run_concurrent(tmp_path, writer)
+        assert errors == [], "Thread errors: {}".format(errors)
+
+    def test_csprng_concurrent_correct_checksums(self, tmp_path):
+        writer = CsprngFileWriter()
+        _, results = self._run_concurrent(tmp_path, writer)
+        assert len(results) == self._N_THREADS
+        for idx, (checksum, size, expected) in results.items():
+            assert size == self._FILE_SIZE, "thread {}: wrong size".format(idx)
+            assert checksum == expected, "thread {}: checksum mismatch".format(idx)
+
+    def test_csprng_concurrent_independent_files(self, tmp_path):
+        """Each thread must write to its own file — no cross-thread contamination."""
+        writer = CsprngFileWriter()
+        _, results = self._run_concurrent(tmp_path, writer)
+        sizes = [r[1] for r in results.values()]
+        assert all(s == self._FILE_SIZE for s in sizes)
+
+    def test_buffer_reuse_concurrent_no_errors(self, tmp_path):
+        writer = BufferReuseFileWriter(ring_size=_MIN_RING_SIZE)
+        errors, results = self._run_concurrent(tmp_path, writer)
+        assert errors == [], "Thread errors: {}".format(errors)
+
+    def test_buffer_reuse_concurrent_correct_checksums(self, tmp_path):
+        writer = BufferReuseFileWriter(ring_size=_MIN_RING_SIZE)
+        _, results = self._run_concurrent(tmp_path, writer)
+        assert len(results) == self._N_THREADS
+        for idx, (checksum, size, expected) in results.items():
+            assert size == self._FILE_SIZE, "thread {}: wrong size".format(idx)
+            assert checksum == expected, "thread {}: checksum mismatch".format(idx)
+
+
 class TestGetFileWriter:
     def test_csprng_returns_csprng_writer(self):
         w = get_file_writer("csprng")

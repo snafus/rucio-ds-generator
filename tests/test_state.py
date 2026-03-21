@@ -278,6 +278,50 @@ class TestThreadSafety:
         for k in keys:
             assert sf.get_file(k)["status"] == FileStatus.REGISTERED
 
+    def test_get_files_by_status_concurrent_with_update(self, state_path):
+        """
+        get_files_by_status must not raise when update() runs concurrently.
+
+        Iterating the live dict while another thread modifies an entry value
+        is safe in CPython (no size change), but iterating while allocate()
+        adds keys would raise RuntimeError.  This test simulates the update
+        case; the list() snapshot in get_files_by_status covers the allocate
+        case.
+        """
+        sf = StateFile(path=state_path, run_id="readwrite")
+        keys = ["file_{:06d}".format(i) for i in range(20)]
+        for k in keys:
+            sf.allocate(k)
+
+        errors = []
+        stop = threading.Event()
+
+        def reader():
+            while not stop.is_set():
+                try:
+                    sf.get_files_by_status(FileStatus.PENDING, FileStatus.REGISTERED)
+                except Exception as exc:
+                    errors.append(exc)
+                    stop.set()
+
+        def writer(key):
+            try:
+                sf.update(key, status=FileStatus.REGISTERED)
+            except Exception as exc:
+                errors.append(exc)
+
+        reader_thread = threading.Thread(target=reader)
+        reader_thread.start()
+        writer_threads = [threading.Thread(target=writer, args=(k,)) for k in keys]
+        for t in writer_threads:
+            t.start()
+        for t in writer_threads:
+            t.join()
+        stop.set()
+        reader_thread.join()
+
+        assert errors == [], "Errors during concurrent read/write: {}".format(errors)
+
 
 # ---------------------------------------------------------------------------
 # FileStatus constants

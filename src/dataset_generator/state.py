@@ -167,10 +167,14 @@ class StateFile(object):
 
         Each returned dict includes the ``key`` field so the caller can
         reference the entry later.
+
+        Iterates over a shallow snapshot of the files dict so that a
+        concurrent ``allocate`` call (which adds keys) cannot cause
+        ``RuntimeError: dictionary changed size during iteration``.
         """
         status_set = set(statuses)
         result = []
-        for key, entry in self._state["files"].items():
+        for key, entry in list(self._state["files"].items()):
             if entry.get("status") in status_set:
                 row = dict(entry)
                 row["key"] = key
