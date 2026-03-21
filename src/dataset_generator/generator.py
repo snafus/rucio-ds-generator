@@ -677,7 +677,10 @@ def run_generation(config, state, rucio_manager, new_count=None):
 
     finally:
         pool.join()
-        placement_executor.shutdown(wait=False)   # futures already awaited above
+        # wait=True: in the happy path all futures are already done (zero cost).
+        # In the error path this allows in-flight placement threads to complete
+        # or fail cleanly, preventing orphaned .part files on the RSE.
+        placement_executor.shutdown(wait=True)
         listener.stop()
 
     if failures:
