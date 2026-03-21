@@ -157,6 +157,24 @@ class TestWriteFile:
             content = fh.read()
         assert len(content) == 256
 
+    def test_size_mismatch_raises(self, tmp_path):
+        """If the on-disk size does not match the requested size, raise RuntimeError."""
+        path = str(tmp_path / "truncated")
+        # Simulate a short write by making os.stat report the wrong size.
+        real_stat = os.stat
+        def fake_stat(p, **kw):
+            result = real_stat(p, **kw)
+            # Return a stat_result with st_size = 0 to simulate truncation.
+            return os.stat_result((
+                result.st_mode, result.st_ino, result.st_dev,
+                result.st_nlink, result.st_uid, result.st_gid,
+                0,  # st_size — wrong on purpose
+                result.st_atime, result.st_mtime, result.st_ctime,
+            ))
+        with patch("os.stat", side_effect=fake_stat):
+            with pytest.raises(RuntimeError, match="File size mismatch"):
+                _write_file(path, 256)
+
 
 # ---------------------------------------------------------------------------
 # _place_file

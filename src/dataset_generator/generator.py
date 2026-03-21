@@ -254,6 +254,13 @@ def _write_file(path, size_bytes):
     finally:
         os.close(fd)
 
+    actual = os.stat(path).st_size
+    if actual != size_bytes:
+        raise RuntimeError(
+            "File size mismatch after write: expected {} bytes, "
+            "got {} bytes ({})".format(size_bytes, actual, path)
+        )
+
     return checksum, bytes_written
 
 
