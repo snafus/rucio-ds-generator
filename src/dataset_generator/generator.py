@@ -114,31 +114,43 @@ def _generate_one(idx, config, state, rucio_manager, writer, progress_lock, prog
     tmp_name = "{}.tmp.{:06d}".format(config.file_prefix, idx)
     tmp_path = os.path.join(staging_dir, tmp_name)
 
-    log.debug("[%s|file-%06d] Starting generation (staging=%s)", thread_name, idx, staging_dir)
+    log.debug("[%s|file-%06d] Starting generation: staging=%s size=%d",
+              thread_name, idx, staging_dir, config.file_size_bytes)
 
     try:
         if config.dry_run:
             checksum_val = 0xDEADBEEF & 0xFFFFFFFF
             bytes_written = config.file_size_bytes
+            log.debug("[%s|file-%06d] dry-run: skipping write", thread_name, idx)
         else:
+            log.debug("[%s|file-%06d] Writing to staging: %s", thread_name, idx, tmp_path)
             checksum_val, bytes_written = writer.write_file(tmp_path, config.file_size_bytes)
+            log.debug("[%s|file-%06d] Write complete: %d bytes, adler32=%08x",
+                      thread_name, idx, bytes_written, checksum_val)
 
         checksum_hex = format(checksum_val, "08x")
         lfn_name = "{}_{}".format(config.file_prefix, checksum_hex)
         lfn = "{}:{}".format(config.scope, lfn_name)
 
-        log.debug("[%s|file-%06d] checksum=%s lfn=%s", thread_name, idx, checksum_hex, lfn)
+        log.debug("[%s|file-%06d] LFN: %s (adler32=%s)", thread_name, idx, lfn, checksum_hex)
 
         # Resolve Rucio PFN, then translate to local filesystem path.
         if config.dry_run:
             local_pfn = os.path.join(config.rse_mount, config.scope, lfn_name)
+            log.debug("[%s|file-%06d] dry-run: synthetic pfn=%s", thread_name, idx, local_pfn)
         else:
+            log.debug("[%s|file-%06d] Resolving PFN for rse=%s lfn=%s",
+                      thread_name, idx, config.rse, lfn)
             rucio_pfn = rucio_manager.lfns2pfn(config.rse, lfn)
             local_pfn = _pfn_to_local(rucio_pfn, config.rse_pfn_prefix, config.rse_mount)
+            log.debug("[%s|file-%06d] PFN resolved: rucio=%s local=%s",
+                      thread_name, idx, rucio_pfn, local_pfn)
 
         if not config.dry_run:
+            log.debug("[%s|file-%06d] Placing file: %s → %s",
+                      thread_name, idx, tmp_path, local_pfn)
             _place_file(tmp_path, local_pfn, uid=config.rse_uid, gid=config.rse_gid)
-            log.debug("[%s|file-%06d] Placed at: %s", thread_name, idx, local_pfn)
+            log.debug("[%s|file-%06d] Placement complete: %s", thread_name, idx, local_pfn)
 
         state.update(
             key,
@@ -308,38 +320,51 @@ def _place_file(staging_path, local_pfn, uid=None, gid=None):
     if parent:
         _makedirs_chown(parent, uid, gid)
 
+    tname = threading.current_thread().name
     part_path = "{}.part.{}.{}".format(local_pfn, os.getpid(), threading.get_ident())
+
+    log.debug("[%s] _place_file: staging=%s part=%s", tname, staging_path, part_path)
 
     # Step 1: move from staging to RSE filesystem (handles cross-filesystem).
     try:
         os.rename(staging_path, part_path)
+        log.debug("[%s] _place_file: same-fs rename ok: %s → %s", tname, staging_path, part_path)
     except OSError as exc:
         if exc.errno != errno.EXDEV:
             raise
         # Cross-filesystem: copy bytes then remove the staging copy.
         # Clean up any partial .part file if the copy fails (e.g. disk full).
+        log.debug("[%s] _place_file: EXDEV — falling back to copy2: %s → %s",
+                  tname, staging_path, part_path)
         try:
             shutil.copy2(staging_path, part_path)
+            log.debug("[%s] _place_file: copy2 ok", tname)
         except Exception:
             try:
                 os.unlink(part_path)
+                log.debug("[%s] _place_file: cleaned up orphaned part after copy2 failure", tname)
             except OSError:
                 pass
             raise
         os.unlink(staging_path)
+        log.debug("[%s] _place_file: staging file removed after copy2", tname)
 
     # Steps 2 & 3: chown then atomic rename on the RSE filesystem.
     # If either fails the .part file is removed so it does not linger on the RSE.
     try:
         if uid is not None or gid is not None:
+            log.debug("[%s] _place_file: chown(%s, uid=%s, gid=%s)", tname, part_path, uid, gid)
             os.chown(part_path,
                      uid if uid is not None else -1,
                      gid if gid is not None else -1)
 
+        log.debug("[%s] _place_file: final rename: %s → %s", tname, part_path, local_pfn)
         os.rename(part_path, local_pfn)
+        log.debug("[%s] _place_file: done: %s", tname, local_pfn)
     except Exception:
         try:
             os.unlink(part_path)
+            log.debug("[%s] _place_file: cleaned up part after rename/chown failure", tname)
         except OSError:
             pass
         raise
