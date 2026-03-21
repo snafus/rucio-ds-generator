@@ -10,9 +10,12 @@ import pytest
 
 from dataset_generator.writers import (
     CHUNK_SIZE,
+    BufferReuseFileWriter,
     CsprngFileWriter,
     FileWriter,
+    _DEFAULT_RING_SIZE,
     _HAS_FALLOCATE,
+    _MIN_RING_SIZE,
     _RAND_METHOD,
     _WRITER_REGISTRY,
     get_file_writer,
@@ -120,6 +123,79 @@ class TestCsprngFileWriter:
 # Registry and factory
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# BufferReuseFileWriter
+# ---------------------------------------------------------------------------
+
+class TestBufferReuseFileWriter:
+    # Use the minimum ring size (= CHUNK_SIZE) to keep test memory usage low.
+    _RING = _MIN_RING_SIZE
+
+    @pytest.fixture
+    def writer(self):
+        return BufferReuseFileWriter(ring_size=self._RING)
+
+    def test_is_file_writer_subclass(self, writer):
+        assert isinstance(writer, FileWriter)
+
+    def test_ring_too_small_raises(self):
+        with pytest.raises(ValueError, match="must be >= CHUNK_SIZE"):
+            BufferReuseFileWriter(ring_size=CHUNK_SIZE - 1)
+
+    def test_description_contains_ring_size(self, writer):
+        # ring_size == CHUNK_SIZE == 128 MiB
+        assert "128" in writer.description
+
+    def test_description_contains_chunk_size(self, writer):
+        assert "128" in writer.description
+
+    def test_description_contains_fallocate_status(self, writer):
+        expected = "yes" if _HAS_FALLOCATE else "no"
+        assert "fallocate: {}".format(expected) in writer.description
+
+    def test_write_correct_size(self, tmp_path, writer):
+        path = str(tmp_path / "f")
+        _, size = writer.write_file(path, 4096)
+        assert size == 4096
+        assert os.path.getsize(path) == 4096
+
+    def test_checksum_in_range(self, tmp_path, writer):
+        path = str(tmp_path / "f")
+        checksum, _ = writer.write_file(path, 512)
+        assert 0 <= checksum <= 0xFFFFFFFF
+
+    def test_size_mismatch_raises(self, tmp_path, writer):
+        path = str(tmp_path / "f")
+        real_stat = os.stat
+        def fake_stat(p, **kw):
+            r = real_stat(p, **kw)
+            return os.stat_result((r.st_mode, r.st_ino, r.st_dev, r.st_nlink,
+                                   r.st_uid, r.st_gid, 0,
+                                   r.st_atime, r.st_mtime, r.st_ctime))
+        with patch("os.stat", side_effect=fake_stat):
+            with pytest.raises(RuntimeError, match="File size mismatch"):
+                writer.write_file(path, 256)
+
+    def test_from_config_reads_ring_size(self):
+        class FakeConfig:
+            buffer_reuse_ring_size = _MIN_RING_SIZE
+
+        w = BufferReuseFileWriter.from_config(FakeConfig())
+        assert w._ring_size == _MIN_RING_SIZE
+
+    def test_from_config_none_uses_default(self):
+        w = BufferReuseFileWriter.from_config(None)
+        assert w._ring_size == _DEFAULT_RING_SIZE
+
+    def test_extended_buffer_length(self, writer):
+        # Extended buffer = ring_size + CHUNK_SIZE bytes (wrap-around copy).
+        assert len(writer._extended) == self._RING + CHUNK_SIZE
+
+    def test_thread_safe_read_only_after_construction(self, writer):
+        # _extended must be a memoryview (read-only after construction).
+        assert isinstance(writer._extended, memoryview)
+
+
 class TestGetFileWriter:
     def test_csprng_returns_csprng_writer(self):
         w = get_file_writer("csprng")
@@ -137,6 +213,13 @@ class TestGetFileWriter:
 
     def test_registry_contains_csprng(self):
         assert "csprng" in _WRITER_REGISTRY
+
+    def test_registry_contains_buffer_reuse(self):
+        assert "buffer-reuse" in _WRITER_REGISTRY
+
+    def test_buffer_reuse_returns_buffer_reuse_writer(self):
+        w = get_file_writer("buffer-reuse")
+        assert isinstance(w, BufferReuseFileWriter)
 
     def test_each_call_returns_new_instance(self):
         w1 = get_file_writer("csprng")

@@ -215,7 +215,16 @@ def _build_parser():
         "--generation-mode", dest="generation_mode", metavar="MODE",
         help=(
             "File-generation back-end. Default: csprng. "
-            "Available: csprng (streaming pseudo-random, fastest available PRNG)."
+            "Available: csprng (streaming pseudo-random), "
+            "buffer-reuse (pre-filled ring buffer; disk/memory-bandwidth-limited)."
+        ),
+    )
+    ovr.add_argument(
+        "--buffer-reuse-ring-size", dest="buffer_reuse_ring_size", metavar="SIZE",
+        help=(
+            "Ring buffer size for buffer-reuse mode. "
+            "Accepts an integer (bytes) or human-readable string: 512MiB, 1GiB, 2GB. "
+            "Must be >= 128 MiB (CHUNK_SIZE). Default: 512MiB."
         ),
     )
     ovr.add_argument(

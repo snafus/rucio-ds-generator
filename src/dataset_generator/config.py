@@ -155,7 +155,8 @@ class Config(object):
         "dataset_name": None,    # None → dynamic {prefix}_{date}_{run_id}
         "container_name": None,  # None → no container attachment
         "registry_file": None,   # None → DEFAULT_REGISTRY_FILE; "" → disabled
-        "generation_mode": "csprng",  # FileWriter back-end; see writers.py
+        "generation_mode": "csprng",        # FileWriter back-end; see writers.py
+        "buffer_reuse_ring_size": "512MiB", # ring buffer size for buffer-reuse mode
     }
 
     def __init__(
@@ -189,7 +190,8 @@ class Config(object):
         dataset_name=None,   # type: Optional[str]  fixed dataset name; None = dynamic {prefix}_{date}_{run_id}
         container_name=None,    # type: Optional[str]  container DID name; None = no container attachment
         registry_file=None,     # type: Optional[str]  registry path; None = default; "" = disabled
-        generation_mode="csprng",  # type: str  FileWriter back-end key; see writers.py
+        generation_mode="csprng",          # type: str  FileWriter back-end key; see writers.py
+        buffer_reuse_ring_size="512MiB",   # type: object  Ring size for buffer-reuse mode
     ):
         self.scope = scope
         self.rse = rse
@@ -224,6 +226,9 @@ class Config(object):
         # registry_file: None means use default path; "" means disabled
         self.registry_file = registry_file if registry_file is not None else None
         self.generation_mode = generation_mode or "csprng"
+        self.buffer_reuse_ring_size = _parse_size(
+            buffer_reuse_ring_size if buffer_reuse_ring_size is not None else "512MiB"
+        )
 
     # ------------------------------------------------------------------
     # Computed properties
@@ -460,6 +465,7 @@ class Config(object):
             container_name=get("container_name"),
             registry_file=get("registry_file"),
             generation_mode=get("generation_mode"),
+            buffer_reuse_ring_size=get("buffer_reuse_ring_size"),
         )
 
     # ------------------------------------------------------------------

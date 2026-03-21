@@ -406,7 +406,7 @@ def run_generation(config, state, rucio_manager, new_count=None):
         len(to_generate), config.threads, len(already_done),
     )
 
-    writer = get_file_writer(config.generation_mode)
+    writer = get_file_writer(config.generation_mode, config)
     log.info("File writer: %s", writer.description)
 
     results = list(already_done)
