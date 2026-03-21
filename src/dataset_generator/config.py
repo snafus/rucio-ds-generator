@@ -155,6 +155,7 @@ class Config(object):
         "dataset_name": None,    # None → dynamic {prefix}_{date}_{run_id}
         "container_name": None,  # None → no container attachment
         "registry_file": None,   # None → DEFAULT_REGISTRY_FILE; "" → disabled
+        "generation_mode": "csprng",  # FileWriter back-end; see writers.py
     }
 
     def __init__(
@@ -186,8 +187,9 @@ class Config(object):
         staging_dir=None,    # type: Optional[str]  staging area for file creation; None = system temp
         rse_pfn_prefix=None, # type: Optional[str]  PFN prefix to replace with rse_mount; None = no translation
         dataset_name=None,   # type: Optional[str]  fixed dataset name; None = dynamic {prefix}_{date}_{run_id}
-        container_name=None, # type: Optional[str]  container DID name; None = no container attachment
-        registry_file=None,  # type: Optional[str]  registry path; None = default; "" = disabled
+        container_name=None,    # type: Optional[str]  container DID name; None = no container attachment
+        registry_file=None,     # type: Optional[str]  registry path; None = default; "" = disabled
+        generation_mode="csprng",  # type: str  FileWriter back-end key; see writers.py
     ):
         self.scope = scope
         self.rse = rse
@@ -221,6 +223,7 @@ class Config(object):
         self._state_file = state_file
         # registry_file: None means use default path; "" means disabled
         self.registry_file = registry_file if registry_file is not None else None
+        self.generation_mode = generation_mode or "csprng"
 
     # ------------------------------------------------------------------
     # Computed properties
@@ -456,6 +459,7 @@ class Config(object):
             dataset_name=dataset_name_override,
             container_name=get("container_name"),
             registry_file=get("registry_file"),
+            generation_mode=get("generation_mode"),
         )
 
     # ------------------------------------------------------------------

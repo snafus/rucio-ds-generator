@@ -212,6 +212,13 @@ def _build_parser():
         ),
     )
     ovr.add_argument(
+        "--generation-mode", dest="generation_mode", metavar="MODE",
+        help=(
+            "File-generation back-end. Default: csprng. "
+            "Available: csprng (streaming pseudo-random, fastest available PRNG)."
+        ),
+    )
+    ovr.add_argument(
         "--registry-file", dest="registry_file", metavar="PATH",
         help=(
             "Path to the global dataset registry JSON file. "

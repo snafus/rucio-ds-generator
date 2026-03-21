@@ -28,7 +28,7 @@ File generation pipeline (per file)
 Threading model
 ---------------
 Pool A (``--threads``, default 4) is used for file generation.  This pool
-is CPU/IO bound (PRNG + write).  A separate Pool B (in
+is CPU/IO bound (``FileWriter.write_file`` + staging I/O).  A separate Pool B (in
 ``rucio_client`` / ``__main__``) handles network-bound Rucio API calls.
 
 Each thread pre-allocates its state entry at submission time, before any
@@ -54,47 +54,16 @@ import errno
 import logging
 import os
 import shutil
-import sys
 import threading
-import zlib
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Optional
 
 from tqdm import tqdm
 
 from .state import FileStatus, StateFile
+from .writers import FileWriter, get_file_writer
 
 log = logging.getLogger(__name__)
-
-# ---------------------------------------------------------------------------
-# Runtime capability detection — resolved once at import, logged at run time.
-# ---------------------------------------------------------------------------
-
-# Chunk size for streaming write.  128 MiB halves loop/allocation overhead
-# vs the previous 64 MiB while keeping peak RSS manageable across threads.
-CHUNK_SIZE = 128 * 1024 * 1024  # 128 MiB per write chunk
-
-# Fastest available bulk-random-bytes generator.
-#
-# Python 3.9+  random.randbytes — MT19937 PRNG running entirely in userspace;
-#              ~2–4× faster than os.urandom for large sequential generation.
-#              Not cryptographically secure, which is fine for test data.
-#
-# Python 3.6–3.8  os.urandom — calls getrandom() on Linux 3.17+, /dev/urandom
-#              elsewhere.  No faster stdlib alternative exists: random.getrandbits
-#              + bigint .to_bytes is slower for multi-MiB sizes due to Python
-#              bigint overhead.
-if sys.version_info >= (3, 9):
-    from random import randbytes as _randbytes
-    _RAND_METHOD = "random.randbytes (MT19937, Python {}.{})".format(*sys.version_info[:2])
-else:
-    _randbytes = os.urandom
-    _RAND_METHOD = "os.urandom (CSPRNG, Python {}.{})".format(*sys.version_info[:2])
-
-# posix_fallocate pre-allocates the full file extent on disk before any data
-# is written, eliminating extent-allocation overhead during sequential writes.
-# Available on Linux/macOS; absent on Windows and some exotic filesystems.
-_HAS_FALLOCATE = hasattr(os, "posix_fallocate")
 
 
 # ---------------------------------------------------------------------------
@@ -107,8 +76,8 @@ def _state_key(idx):
     return "file_{:06d}".format(idx)
 
 
-def _generate_one(idx, config, state, rucio_manager, progress_lock, progress_bar):
-    # type: (int, object, StateFile, object, threading.Lock, tqdm) -> dict
+def _generate_one(idx, config, state, rucio_manager, writer, progress_lock, progress_bar):
+    # type: (int, object, StateFile, object, FileWriter, threading.Lock, tqdm) -> dict
     """
     Generate a single file and update state.
 
@@ -126,6 +95,9 @@ def _generate_one(idx, config, state, rucio_manager, progress_lock, progress_bar
         ``StateFile`` instance shared across all threads.
     rucio_manager:
         ``RucioManager`` instance — used for ``lfns2pfn`` only.
+    writer:
+        ``FileWriter`` instance used to write the file contents.  Shared
+        across all Pool A threads; must be thread-safe.
     progress_lock:
         Lock protecting writes to the ``tqdm`` progress bar from multiple
         threads.
@@ -149,7 +121,7 @@ def _generate_one(idx, config, state, rucio_manager, progress_lock, progress_bar
             checksum_val = 0xDEADBEEF & 0xFFFFFFFF
             bytes_written = config.file_size_bytes
         else:
-            checksum_val, bytes_written = _write_file(tmp_path, config.file_size_bytes)
+            checksum_val, bytes_written = writer.write_file(tmp_path, config.file_size_bytes)
 
         checksum_hex = format(checksum_val, "08x")
         lfn_name = "{}_{}".format(config.file_prefix, checksum_hex)
@@ -203,65 +175,6 @@ def _generate_one(idx, config, state, rucio_manager, progress_lock, progress_bar
             pass
         state.update(key, status=FileStatus.FAILED_CREATION)
         raise
-
-
-def _write_file(path, size_bytes):
-    # type: (str, int) -> tuple
-    """
-    Write *size_bytes* of random data to *path* in ``CHUNK_SIZE`` chunks.
-
-    Returns ``(checksum_val, bytes_written)`` where ``checksum_val`` is the
-    accumulated adler32 with the ``& 0xFFFFFFFF`` mask applied.
-
-    Implementation notes
-    --------------------
-    * Uses a raw OS file descriptor (``os.open`` / ``os.write``) rather than
-      a Python ``BufferedWriter`` to avoid an extra ~chunk-sized ``memcpy``
-      through the Python-level write buffer on each iteration.
-    * ``memoryview`` slices in the write loop avoid data copies when
-      ``os.write`` performs a short write (rare for local filesystems but
-      handled correctly).
-    * ``os.posix_fallocate`` pre-allocates the full extent before writing,
-      eliminating extent-allocation latency during sequential writes.
-    * The PRNG (``_randbytes``) is selected once at module import; see the
-      module-level ``_RAND_METHOD`` / ``_HAS_FALLOCATE`` constants.
-    """
-    checksum = 1  # adler32 initial value per RFC 1950
-    bytes_written = 0
-    remaining = size_bytes
-
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o666)
-    try:
-        # Pre-allocate full extent; silently ignored if unsupported.
-        if _HAS_FALLOCATE:
-            try:
-                os.posix_fallocate(fd, 0, size_bytes)
-            except OSError:
-                pass
-
-        while remaining > 0:
-            chunk = min(CHUNK_SIZE, remaining)
-            data = _randbytes(chunk)
-            # Use memoryview so partial-write loop slices don't copy bytes.
-            view = memoryview(data)
-            written = 0
-            while written < chunk:
-                written += os.write(fd, view[written:])
-            # Apply mask on every iteration to keep value in 32-bit range.
-            checksum = zlib.adler32(data, checksum) & 0xFFFFFFFF
-            bytes_written += chunk
-            remaining -= chunk
-    finally:
-        os.close(fd)
-
-    actual = os.stat(path).st_size
-    if actual != size_bytes:
-        raise RuntimeError(
-            "File size mismatch after write: expected {} bytes, "
-            "got {} bytes ({})".format(size_bytes, actual, path)
-        )
-
-    return checksum, bytes_written
 
 
 def _makedirs_chown(path, uid, gid):
@@ -492,12 +405,9 @@ def run_generation(config, state, rucio_manager, new_count=None):
         "Generating %d file(s) using %d thread(s) [%d already done]",
         len(to_generate), config.threads, len(already_done),
     )
-    log.info(
-        "Write method: %s | chunk: %d MiB | fallocate: %s",
-        _RAND_METHOD,
-        CHUNK_SIZE // (1024 * 1024),
-        "yes" if _HAS_FALLOCATE else "no",
-    )
+
+    writer = get_file_writer(config.generation_mode)
+    log.info("File writer: %s", writer.description)
 
     results = list(already_done)
     failures = []
@@ -517,7 +427,7 @@ def run_generation(config, state, rucio_manager, new_count=None):
             futures = {
                 pool.submit(
                     _generate_one,
-                    idx, config, state, rucio_manager, progress_lock, pbar,
+                    idx, config, state, rucio_manager, writer, progress_lock, pbar,
                 ): idx
                 for idx in to_generate
             }
