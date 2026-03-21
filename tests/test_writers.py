@@ -114,6 +114,32 @@ class TestCsprngFileWriter:
             with pytest.raises(RuntimeError, match="File size mismatch"):
                 writer.write_file(path, 256)
 
+    def test_partial_write_loop_completes_full_chunk(self, tmp_path, writer):
+        """
+        If os.write returns fewer bytes than requested (partial write), the
+        inner loop must keep writing until the full chunk is flushed.
+
+        Simulates a kernel that accepts at most 100 bytes per write() call.
+        """
+        real_write = os.write
+        call_sizes = []
+
+        def capped_write(fd, data):
+            # Accept at most 100 bytes per call to simulate partial writes.
+            chunk = bytes(data[:100])
+            call_sizes.append(len(chunk))
+            return real_write(fd, chunk)
+
+        size = 512
+        with patch("os.write", side_effect=capped_write):
+            checksum, written = writer.write_file(str(tmp_path / "f"), size)
+
+        assert written == size
+        assert os.path.getsize(str(tmp_path / "f")) == size
+        # Must have taken multiple write() calls per chunk (512 / 100 = 6 calls).
+        assert len(call_sizes) >= 6
+        assert 0 <= checksum <= 0xFFFFFFFF
+
     def test_thread_safe_no_shared_mutable_state(self, writer):
         """CsprngFileWriter has no instance attributes — safe to share across threads."""
         assert writer.__dict__ == {}
@@ -175,6 +201,28 @@ class TestBufferReuseFileWriter:
         with patch("os.stat", side_effect=fake_stat):
             with pytest.raises(RuntimeError, match="File size mismatch"):
                 writer.write_file(path, 256)
+
+    def test_partial_write_loop_completes_full_chunk(self, tmp_path, writer):
+        """
+        If os.write returns fewer bytes than requested, the inner loop must
+        keep writing until the full chunk is flushed.
+        """
+        real_write = os.write
+        call_sizes = []
+
+        def capped_write(fd, data):
+            chunk = bytes(data[:100])
+            call_sizes.append(len(chunk))
+            return real_write(fd, chunk)
+
+        size = 512
+        with patch("os.write", side_effect=capped_write):
+            checksum, written = writer.write_file(str(tmp_path / "f"), size)
+
+        assert written == size
+        assert os.path.getsize(str(tmp_path / "f")) == size
+        assert len(call_sizes) >= 6
+        assert 0 <= checksum <= 0xFFFFFFFF
 
     def test_from_config_reads_ring_size(self):
         class FakeConfig:
