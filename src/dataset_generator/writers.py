@@ -35,12 +35,16 @@ buffer-reuse
     Configured by ``buffer_reuse_ring_size`` (default 512 MiB).
 """
 
+import logging
 import os
 import random
 import sys
+import threading
 import zlib
 from abc import ABC, abstractmethod
 from typing import Any, Optional
+
+log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Runtime capability detection — resolved once at import, logged at run time.
@@ -72,6 +76,15 @@ else:
 # is written, eliminating extent-allocation overhead during sequential writes.
 # Available on Linux/macOS; absent on Windows and some exotic filesystems.
 _HAS_FALLOCATE = hasattr(os, "posix_fallocate")
+
+
+def _fmt_size(n):
+    # type: (int) -> str
+    """Format *n* bytes as a human-readable string (GiB/MiB/KiB/B)."""
+    for unit, divisor in (("GiB", 1 << 30), ("MiB", 1 << 20), ("KiB", 1 << 10)):
+        if n >= divisor:
+            return "{:.1f} {}".format(n / divisor, unit)
+    return "{} B".format(n)
 
 
 # ---------------------------------------------------------------------------
@@ -169,20 +182,36 @@ class CsprngFileWriter(FileWriter):
 
     def write_file(self, path, size_bytes):
         # type: (str, int) -> tuple
+        tname = threading.current_thread().name
+        log.debug("[%s] csprng write_file: path=%s size=%d", tname, path, size_bytes)
+
+        # Log at INFO for large files (≥ 1 GiB); emit progress every 10%.
+        _GIB = 1024 * 1024 * 1024
+        progress_interval = size_bytes // 10 if size_bytes >= _GIB else 0
+        next_progress = progress_interval
+
+        log.info("[%s] Writing %s (%d bytes) csprng → %s",
+                 tname, _fmt_size(size_bytes), size_bytes, path)
+
         checksum = 1  # adler32 initial value per RFC 1950
         bytes_written = 0
         remaining = size_bytes
+        chunk_num = 0
 
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o666)
         try:
             # Pre-allocate full extent; silently ignored if unsupported.
+            # NOTE: posix_fallocate extends the file to size_bytes immediately,
+            # so 'ls -la' will show the final file size before data is written.
             if _HAS_FALLOCATE:
                 try:
                     os.posix_fallocate(fd, 0, size_bytes)
-                except OSError:
-                    pass
+                    log.debug("[%s] fallocate: ok (%d bytes)", tname, size_bytes)
+                except OSError as exc:
+                    log.debug("[%s] fallocate: skipped (%s)", tname, exc)
 
             while remaining > 0:
+                chunk_num += 1
                 chunk = min(CHUNK_SIZE, remaining)
                 data = _randbytes(chunk)
                 # memoryview avoids a copy in the partial-write loop.
@@ -194,8 +223,16 @@ class CsprngFileWriter(FileWriter):
                 checksum = zlib.adler32(data, checksum) & 0xFFFFFFFF
                 bytes_written += chunk
                 remaining -= chunk
+                log.debug("[%s] chunk %d: wrote %d bytes, checksum=%08x, remaining=%d",
+                          tname, chunk_num, chunk, checksum, remaining)
+                if progress_interval and bytes_written >= next_progress:
+                    pct = 100 * bytes_written // size_bytes
+                    log.info("[%s] Write progress: %d%% (%s / %s)",
+                             tname, pct, _fmt_size(bytes_written), _fmt_size(size_bytes))
+                    next_progress += progress_interval
         finally:
             os.close(fd)
+            log.debug("[%s] fd closed: %s", tname, path)
 
         actual = os.stat(path).st_size
         if actual != size_bytes:
@@ -204,6 +241,10 @@ class CsprngFileWriter(FileWriter):
                 "got {} bytes ({})".format(size_bytes, actual, path)
             )
 
+        log.info("[%s] Write complete: %s in %d chunk(s), adler32=%08x → %s",
+                 tname, _fmt_size(bytes_written), chunk_num, checksum, path)
+        log.debug("[%s] csprng write_file done: %d bytes in %d chunk(s), adler32=%08x",
+                  tname, bytes_written, chunk_num, checksum)
         return checksum, bytes_written
 
 
@@ -299,25 +340,42 @@ class BufferReuseFileWriter(FileWriter):
 
     def write_file(self, path, size_bytes):
         # type: (str, int) -> tuple
+        tname = threading.current_thread().name
+        log.debug("[%s] buffer-reuse write_file: path=%s size=%d ring=%d",
+                  tname, path, size_bytes, self._ring_size)
+
+        # Log at INFO for large files (≥ 1 GiB); emit progress every 10%.
+        _GIB = 1024 * 1024 * 1024
+        progress_interval = size_bytes // 10 if size_bytes >= _GIB else 0
+        next_progress = progress_interval
+
+        log.info("[%s] Writing %s (%d bytes) buffer-reuse → %s",
+                 tname, _fmt_size(size_bytes), size_bytes, path)
+
         checksum = 1  # adler32 initial value per RFC 1950
         bytes_written = 0
         remaining = size_bytes
         extended = self._extended  # local ref avoids repeated attr lookup
+        chunk_num = 0
 
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o666)
         try:
             if _HAS_FALLOCATE:
                 try:
                     os.posix_fallocate(fd, 0, size_bytes)
-                except OSError:
-                    pass
+                    log.debug("[%s] fallocate: ok (%d bytes)", tname, size_bytes)
+                except OSError as exc:
+                    log.debug("[%s] fallocate: skipped (%s)", tname, exc)
 
             while remaining > 0:
+                chunk_num += 1
                 chunk = min(CHUNK_SIZE, remaining)
                 # Random start in [0, ring_size); extension guarantees the
                 # slice [start, start+chunk) is always contiguous.
                 start = random.randrange(self._ring_size)
                 data = extended[start:start + chunk]
+                log.debug("[%s] chunk %d: ring offset=%d len=%d",
+                          tname, chunk_num, start, chunk)
 
                 written = 0
                 while written < chunk:
@@ -327,8 +385,16 @@ class BufferReuseFileWriter(FileWriter):
                 checksum = zlib.adler32(data, checksum) & 0xFFFFFFFF
                 bytes_written += chunk
                 remaining -= chunk
+                log.debug("[%s] chunk %d: wrote %d bytes, checksum=%08x, remaining=%d",
+                          tname, chunk_num, chunk, checksum, remaining)
+                if progress_interval and bytes_written >= next_progress:
+                    pct = 100 * bytes_written // size_bytes
+                    log.info("[%s] Write progress: %d%% (%s / %s)",
+                             tname, pct, _fmt_size(bytes_written), _fmt_size(size_bytes))
+                    next_progress += progress_interval
         finally:
             os.close(fd)
+            log.debug("[%s] fd closed: %s", tname, path)
 
         actual = os.stat(path).st_size
         if actual != size_bytes:
@@ -337,6 +403,10 @@ class BufferReuseFileWriter(FileWriter):
                 "got {} bytes ({})".format(size_bytes, actual, path)
             )
 
+        log.info("[%s] Write complete: %s in %d chunk(s), adler32=%08x → %s",
+                 tname, _fmt_size(bytes_written), chunk_num, checksum, path)
+        log.debug("[%s] buffer-reuse write_file done: %d bytes in %d chunk(s), adler32=%08x",
+                  tname, bytes_written, chunk_num, checksum)
         return checksum, bytes_written
 
 
