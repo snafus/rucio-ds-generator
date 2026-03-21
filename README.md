@@ -1,4 +1,4 @@
-# claude-dataset-generator
+# rucio-ds-generator
 
 A CLI tool for generating dummy test datasets and registering them into
 [Rucio](https://rucio.cern.ch) for file transfer testing.
@@ -18,6 +18,8 @@ target site.
 - [Your first run](#your-first-run)
 - [Operational modes](#operational-modes)
 - [Resuming an interrupted run](#resuming-an-interrupted-run)
+- [Static datasets and container grouping](#static-datasets-and-container-grouping)
+- [Dataset registry](#dataset-registry)
 - [Running the test suite](#running-the-test-suite)
 - [CLI reference](#cli-reference)
 - [Troubleshooting](#troubleshooting)
@@ -40,8 +42,8 @@ target site.
 ### 1. Clone the repository
 
 ```bash
-git clone https://github.com/your-org/claude-dataset-generator.git
-cd claude-dataset-generator
+git clone https://github.com/snafus/rucio-ds-generator.git
+cd rucio-ds-generator
 ```
 
 ### 2. Create and activate a virtual environment
@@ -75,8 +77,86 @@ dataset-generator --help
 
 ## Configuration
 
-All settings live in a YAML file. Copy the annotated example and edit for your
-site:
+Configuration has three layers, applied in order of precedence (highest first):
+
+1. **CLI flags** — `--rucio-host`, `--client-secret`, etc.
+2. **Environment variables** — loaded from a `.env` file or the shell environment
+3. **YAML file** — `--config my_site.yaml`
+
+### Step 1 — Rucio client config (`rucio.cfg`)
+
+Rucio's client library requires a `rucio.cfg` before it will start.
+Create a minimal one and point `RUCIO_CONFIG` at it (see Step 2):
+
+```ini
+[client]
+rucio_host  = https://rucio.example.org
+auth_host   = https://rucio-auth.example.org
+account     = your-account
+auth_type   = oidc
+oidc_scope  = openid profile offline_access
+oidc_audience = rucio
+auth_oidc_refresh_active     = True
+auth_oidc_refresh_before_exp = 20
+request_retries = 3
+```
+
+`rucio.cfg` is git-ignored. Place it anywhere and set `RUCIO_CONFIG` to its
+absolute path, or put it at `$VIRTUAL_ENV/etc/rucio.cfg`.
+
+**OIDC and token refresh:**
+
+| Setting | Value | Purpose |
+|---|---|---|
+| `auth_type` | `oidc` | Use OIDC bearer tokens |
+| `oidc_scope` | `openid profile offline_access` | Enables refresh tokens |
+| `auth_oidc_refresh_active` | `True` | Auto-refresh before expiry |
+| `auth_oidc_refresh_before_exp` | `20` | Refresh 20 min before expiry |
+
+For service-account / robot use, this tool obtains tokens via the OAuth 2.0
+**client_credentials** grant and re-fetches automatically when the token
+expires — long-running jobs stay authenticated without manual intervention.
+
+### Step 2 — Sensitive credentials (`.env`)
+
+Endpoints, account name, and OIDC client credentials belong in `.env`:
+
+```bash
+cp .env.template .env
+$EDITOR .env
+```
+
+`.env` is git-ignored. `.env.template` (with placeholder values) is committed so
+the required variable names are always visible. The variables that are read:
+
+| Variable | Purpose |
+|---|---|
+| `RUCIO_CONFIG` | Path to your `rucio.cfg` |
+| `RUCIO_HOST` | Rucio server URL |
+| `RUCIO_AUTH_HOST` | Rucio auth server URL |
+| `RUCIO_ACCOUNT` | Your Rucio account name |
+| `OIDC_TOKEN_ENDPOINT` | IAM token endpoint (client credentials grant) |
+| `OIDC_CLIENT_ID` | OIDC client ID |
+| `OIDC_CLIENT_SECRET` | OIDC client secret |
+
+Variables already set in the shell take precedence over `.env` (standard
+`python-dotenv` behaviour with `override=False`).
+
+### Verify auth
+
+Once both files are in place, verify connectivity before running a real job:
+
+```bash
+dataset-generator --check-auth
+# Auth OK
+#   account : myaccount
+#   status  : ACTIVE
+#   type    : SERVICE
+```
+
+### YAML config
+
+Copy the annotated example and edit for your site:
 
 ```bash
 cp config.example.yaml my_site.yaml
@@ -90,36 +170,92 @@ scope: cms                                    # Rucio scope for all DIDs
 rse: T2_US_Wisconsin                          # Target RSE name
 rse_mount: /mnt/hadoop/store/rucio            # POSIX path to RSE storage on this host
 
-# Dataset and file naming
-dataset_prefix: transfer_test                 # Final name: {prefix}_{date}_{run_id}
-file_prefix: dummy                            # Final name: {prefix}_{adler32hex}
+# Dataset and file naming  (Jinja2 templates supported — see below)
+dataset_prefix: transfer_test                 # Default name: {prefix}_{date}_{run_id}
+file_prefix: dummy                            # Final filename: {prefix}_{adler32hex}
 
 # Generation parameters
 num_files: 10
-file_size_bytes: 1073741824                   # 1 GiB per file
-
-# OIDC credentials
-token_endpoint: https://cms-iam.cern.ch/token
-client_id: my-robot-client
-client_secret: s3cr3t
-
-# Rucio endpoints
-rucio_host: https://cms-rucio.cern.ch
-rucio_auth_host: https://cms-rucio-auth.cern.ch
-rucio_account: robot_account
+file_size_bytes: 1GiB          # raw integer bytes, or human-readable:
+                               #   IEC (binary): KiB/MiB/GiB/TiB/PiB
+                               #   SI  (decimal): KB/MB/GB/TB/PB
+                               #   Bare K/M/G/T/P = binary
 ```
+
+### Jinja2 naming templates
+
+`dataset_name`, `file_prefix`, and `container_name` all support Jinja2
+template syntax.  Plain strings without `{{` are used as-is with no overhead.
+
+Available template variables:
+
+| Variable | Example value | Description |
+|---|---|---|
+| `{{ date }}` | `20260321` | UTC date, `YYYYMMDD` |
+| `{{ datetime }}` | `20260321_090000` | UTC datetime, `YYYYMMDD_HHMMSS` |
+| `{{ timestamp }}` | `1742547600` | UTC Unix timestamp (integer) |
+| `{{ run_id }}` | `a1b2c3d4e5f6` | 12-character hex run identifier |
+| `{{ scope }}` | `cms` | Rucio scope |
+| `{{ rse }}` | `T2_US_Wisconsin` | Target RSE name |
+| `{{ num_files }}` | `10` | Number of files (integer) |
+| `{{ file_size }}` | `1GiB` | Human-readable file size |
+| `{{ file_size_bytes }}` | `1073741824` | File size in bytes (integer) |
+| `{{ dataset_prefix }}` | `transfer_test` | Dataset prefix string |
+
+Example templates:
+
+```yaml
+# Dataset name encoding the RSE and date
+dataset_name: "{{ dataset_prefix }}_{{ rse }}_{{ date }}"
+# → transfer_test_T2_US_Wisconsin_20260321
+
+# File prefix encoding size and scope
+file_prefix: "{{ scope }}_{{ file_size }}_dummy"
+# → cms_1GiB_dummy  (final filename: cms_1GiB_dummy_1a2b3c4d)
+
+# Container grouping by RSE
+container_name: "{{ scope }}_{{ rse }}_tests"
+# → cms_T2_US_Wisconsin_tests
+```
+
+> **Note on `{{ timestamp }}` in `file_prefix`:** the rendered value is
+> cached on first access and reused for all files within a run, so every file
+> shares an identical prefix even when generation spans many seconds.
 
 Optional settings (shown with their defaults):
 
 ```yaml
-threads: 4                # File-generation threads (Pool A)
+threads: 4                # File-generation threads (Pool A). Default: 4
 log_level: INFO           # DEBUG | INFO | WARNING | ERROR
 rule_lifetime: ~          # Rule lifetime in seconds; null = permanent
                           # e.g. 604800 = 7 days, 2592000 = 30 days
-```
 
-> **Security note:** `client_secret` is sensitive. Do not commit `my_site.yaml`
-> to version control. Use environment-specific files or a secrets manager.
+# Static or template dataset name — reuse the same dataset DID across runs (see below)
+# dataset_name: "{{ dataset_prefix }}_{{ rse }}_{{ date }}"
+
+# Attach datasets to a named Rucio container after each run (see below)
+# container_name: "{{ scope }}_{{ rse }}_tests"
+
+# Staging directory for temporary file creation before placement on the RSE.
+# A unique per-run subdirectory is created here automatically.
+# Default: system temp dir.
+# staging_dir: /scratch/rucio-staging
+
+# PFN prefix translation: if Rucio returns PFNs with a different path root
+# from your local mount, set both of these:
+#   rse_pfn_prefix: davs://xrootd.example.org:1094/store/rucio
+#   rse_mount:      /mnt/rse
+# rse_pfn_prefix: ~
+
+# Ownership for placed files and any hash directories created on the RSE.
+# Omit to keep the process's own uid/gid.
+# rse_uid: 1000
+# rse_gid: 1000
+
+# Global dataset registry file. Default: ~/.rucio-ds-generator/registry.json
+# Set to empty string to disable.
+# registry_file: ~/.rucio-ds-generator/registry.json
+```
 
 Any YAML value can be overridden on the command line — see
 [CLI reference](#cli-reference).
@@ -140,6 +276,7 @@ Expected output:
 
 ```
 2026-03-21T09:00:01 INFO  Starting dataset-generator run_id=a1b2c3d4e5f6 dry_run=True
+2026-03-21T09:00:01 INFO  Dataset DID : cms:transfer_test_20260321_a1b2c3d4e5f6
 2026-03-21T09:00:01 INFO  [DRY-RUN] add_dataset('cms', 'transfer_test_20260321_a1b2c3d4e5f6')
 Generating: 100%|████████████████| 10/10 [00:00<00:00, file]
 2026-03-21T09:00:01 INFO  [DRY-RUN] add_replicas('T2_US_Wisconsin', 10 files)
@@ -147,8 +284,6 @@ Generating: 100%|████████████████| 10/10 [00:00<
 2026-03-21T09:00:01 INFO  [DRY-RUN] add_replication_rule('cms':'transfer_test_20260321_a1b2c3d4e5f6')
 2026-03-21T09:00:01 INFO  Run finished successfully. State: state_a1b2c3d4e5f6.json
 ```
-
-A state file is created (tracking the run ID) but no files are written.
 
 ### Step 2 — Live run
 
@@ -159,15 +294,23 @@ dataset-generator --config my_site.yaml
 The tool:
 
 1. Obtains an OIDC bearer token (client credentials grant).
-2. Creates the dataset DID in Rucio (`add_dataset`).
-3. Generates files in parallel (Pool A, `--threads` workers):
-   - Writes each file to `{rse_mount}/.gen_tmp/` in 64 MiB chunks.
+2. Asserts the target RSE is deterministic.
+3. Creates the dataset DID in Rucio (`add_dataset`).
+4. Counts files already in the dataset (`list_files`) and computes how many
+   new files to generate: `max(0, num_files − existing_in_rucio − state_count)`.
+   If the dataset already has enough files, generation is skipped entirely.
+5. Generates files in parallel (Pool A, `--threads` workers):
+   - Writes each file to a unique per-run staging directory in 64 MiB chunks.
    - Accumulates an adler32 checksum over every chunk.
    - Resolves the final physical path via `lfns2pfns`.
-   - Atomically renames the temp file into position (`os.rename`).
-4. Registers all replicas in a single batch call (`add_replicas`).
-5. Attaches all file DIDs to the dataset (`attach_dids`).
-6. Creates one replication rule on the dataset DID (`add_replication_rule`).
+   - Moves the file to `{final_pfn}.part` on the RSE filesystem, sets
+     ownership (`rse_uid`/`rse_gid` if configured), then atomically renames
+     to the final path.
+6. Registers all replicas in a single batch call (`add_replicas`).
+7. Attaches all file DIDs to the dataset (`attach_dids`).
+8. Creates one replication rule on the dataset DID (`add_replication_rule`).
+9. If `container_name` is set, attaches the dataset to the container.
+10. Updates the dataset registry file.
 
 Progress is shown per file and the final state is written to
 `state_{run_id}.json` in the working directory.
@@ -249,6 +392,104 @@ automatically, so the resume joins the existing dataset.
 
 ---
 
+## Static datasets and container grouping
+
+### Static dataset name
+
+By default each run creates a new dataset DID:
+`{dataset_prefix}_{YYYYMMDD}_{run_id}`.
+
+To accumulate files into the same dataset across multiple runs, set a fixed
+name:
+
+```yaml
+dataset_name: my_persistent_test_dataset
+```
+
+or pass `--dataset-name my_persistent_test_dataset` on the CLI.
+
+On subsequent runs the tool queries the current file count in Rucio and only
+generates the shortfall: `max(0, num_files − existing)`. If the dataset
+already contains at least `num_files` files, generation is skipped entirely
+and the tool proceeds directly to ensuring the replication rule exists.
+A `DuplicateRule` response is caught and logged as a warning.
+
+### Container grouping
+
+To group multiple datasets under a single Rucio container, set `container_name`:
+
+```yaml
+container_name: my_test_container
+```
+
+After each successful run the tool will:
+
+1. Create the container if it does not exist (`add_container`).
+2. Attach the dataset to the container (`attach_dids`).
+
+Attaching a dataset that is already a member of the container
+(`DuplicateContent`) is silently ignored, so re-runs and static dataset names
+are safe.
+
+Verify the container in Rucio:
+
+```bash
+rucio list-dids cms:my_test_container --type container
+rucio list-content cms:my_test_container
+```
+
+---
+
+## Dataset registry
+
+After each successful pipeline run a record is written to a persistent JSON
+registry file (default: `~/.rucio-ds-generator/registry.json`). The registry
+accumulates entries across runs and sites — it is useful for tracking what test
+data exists and where.
+
+Each entry records:
+
+| Field | Description |
+|-------|-------------|
+| `dataset_did` | Full dataset DID (`scope:name`) |
+| `rse` | RSE the data was placed on |
+| `rule_id` | Rucio replication rule ID (most recent run) |
+| `num_files` | Cumulative file count across all runs targeting this dataset |
+| `first_seen` | UTC timestamp of the first run |
+| `last_updated` | UTC timestamp of the most recent run |
+
+```json
+{
+  "version": 1,
+  "datasets": {
+    "cms:my_persistent_test_dataset": {
+      "dataset_did":  "cms:my_persistent_test_dataset",
+      "rse":          "T2_US_Wisconsin",
+      "rule_id":      "a1b2c3d4e5f6...",
+      "num_files":    30,
+      "first_seen":   "2026-03-21T09:00:00Z",
+      "last_updated": "2026-03-21T11:00:00Z"
+    }
+  }
+}
+```
+
+Override the registry path:
+
+```bash
+dataset-generator --config my_site.yaml --registry-file /shared/registry.json
+```
+
+Disable registry recording entirely:
+
+```bash
+dataset-generator --config my_site.yaml --registry-file ""
+# or in YAML:
+# registry_file: ""
+```
+
+---
+
 ## Running the test suite
 
 The tests use only the standard library plus `pytest` — they mock all Rucio
@@ -278,16 +519,17 @@ pip install pytest-cov
 pytest --cov=dataset_generator --cov-report=term-missing
 ```
 
-The suite currently contains **108 tests** across four files:
+The suite currently contains **211 tests** across five files:
 
 | File | What it covers |
 |------|---------------|
-| `tests/test_config.py` | Config construction, YAML+CLI merge, validation |
+| `tests/test_config.py` | Config construction, YAML+CLI merge, validation, dataset/container naming |
 | `tests/test_state.py` | State file lifecycle, atomicity, thread safety |
 | `tests/test_generator.py` | File write, adler32 correctness, atomic rename, Pool A, resume |
-| `tests/test_rucio_client.py` | OIDC token lifecycle, retry logic, all Rucio API calls |
+| `tests/test_rucio_client.py` | OIDC token lifecycle, retry logic, all Rucio API calls, container ops |
+| `tests/test_registry.py` | Registry upsert, persistence, thread safety, atomic write |
 
-All tests run in under one second. No network access or RSE mount is required.
+All tests run in under ten seconds. No network access or RSE mount is required.
 
 ---
 
@@ -296,6 +538,7 @@ All tests run in under one second. No network access or RSE mount is required.
 ```
 usage: dataset-generator [--config PATH] [--dry-run] [--threads N]
                          [--log-level LEVEL] [--state-file PATH] [--run-id ID]
+                         [--check-auth]
                          [--create-only | --register-only | --cleanup]
                          [config overrides ...]
 
@@ -306,6 +549,7 @@ General:
   --log-level LEVEL      DEBUG | INFO | WARNING | ERROR. Default: INFO
   --state-file PATH      Override state file path. Default: ./state_{run_id}.json
   --run-id ID            Override run identifier (12-char hex); used for resume
+  --check-auth           Test OIDC token acquisition and Rucio connectivity, then exit
 
 Operational mode (mutually exclusive):
   --create-only          Generate and place files; skip Rucio registration
@@ -316,11 +560,23 @@ Config overrides (all settable in YAML; CLI wins):
   --scope                Rucio scope
   --rse                  Target RSE name
   --rse-mount            POSIX mount path of RSE storage
-  --dataset-prefix       Dataset DID name prefix
+  --dataset-prefix       Dataset DID name prefix (used for dynamic names)
+  --dataset-name NAME    Fixed dataset DID name; reused across runs
   --file-prefix          File LFN prefix
   --num-files N          Number of files to generate
-  --file-size-bytes N    File size in bytes
+  --file-size-bytes SIZE File size — raw integer bytes or human-readable string.
+                         IEC (binary): KiB, MiB, GiB, TiB, PiB (powers of 1024).
+                         SI (decimal): KB, MB, GB, TB, PB (powers of 1000).
+                         Bare K/M/G/T/P treated as binary. Examples: 1GiB, 512MiB, 1GB, 500MB
   --rule-lifetime SECS   Replication rule lifetime in seconds (omit = permanent)
+  --staging-dir PATH     Directory for temporary file creation (default: system temp)
+  --rse-pfn-prefix PFX   Full PFN prefix returned by Rucio (stripped and replaced
+                         with rse-mount to get the local filesystem path)
+  --rse-uid UID          uid for placed files and newly created RSE directories
+  --rse-gid GID          gid for placed files and newly created RSE directories
+  --container-name NAME  Rucio container to attach the dataset to after each run
+  --registry-file PATH   Global registry JSON path (default: ~/.rucio-ds-generator/registry.json;
+                         set to "" to disable)
   --rucio-host           Rucio server URL
   --rucio-auth-host      Rucio auth server URL
   --rucio-account        Rucio account name
@@ -355,6 +611,15 @@ The token endpoint is unreachable or returned an error. Check:
 - That `client_id` and `client_secret` are correct.
 - That the client has the `rucio` scope or equivalent on your IAM instance.
 
+Use `--check-auth` to test credentials in isolation before a full run.
+
+**`RuntimeError: PFN '...' does not start with rse_pfn_prefix`**
+
+Rucio returned a PFN that doesn't match your configured `rse_pfn_prefix`.
+Run with `--log-level DEBUG` to see the raw PFN returned by `lfns2pfns`, then
+set `rse_pfn_prefix` to the full URL prefix Rucio uses for this RSE
+(e.g. `davs://xrootd.example.org:1094/store/rucio`).
+
 **`StateError: State file '...' has unsupported version`**
 
 The state file was written by an incompatible version of this tool. Do not
@@ -365,6 +630,13 @@ mix state files across major releases.
 Resume the run with `--state-file`. Files in `created` state will be picked
 up and registered. Alternatively, use `--register-only` with the same state
 file.
+
+**`DuplicateRule` warning on re-run with static dataset name**
+
+This is expected behaviour. When `dataset_name` is set and you run the tool
+more than once, Rucio rejects a second rule on the same dataset+RSE
+combination. The tool catches this, logs a warning, and continues — the
+existing rule remains in effect.
 
 **Rule lifetime not taking effect**
 

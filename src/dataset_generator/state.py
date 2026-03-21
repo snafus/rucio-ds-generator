@@ -1,5 +1,5 @@
 """
-state.py — Persistent JSON state file for claude-dataset-generator.
+state.py — Persistent JSON state file for rucio-ds-generator.
 
 Responsibilities
 ----------------
@@ -148,6 +148,11 @@ class StateFile(object):
                 raise StateError("State key {!r} has not been allocated".format(key))
             self._state["files"][key].update(fields)
             self._save_locked()
+
+    def count(self):
+        # type: () -> int
+        """Return the total number of state entries regardless of status."""
+        return len(self._state["files"])
 
     def get_file(self, key):
         # type: (str) -> Optional[dict]

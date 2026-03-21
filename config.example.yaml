@@ -1,5 +1,9 @@
-# Example configuration for claude-dataset-generator
+# Example configuration for rucio-ds-generator
 # CLI arguments override any value set here.
+#
+# Sensitive credentials (Rucio endpoints, OIDC client ID/secret) belong in
+# .env — copy .env.template to .env and fill in real values.
+# Precedence: CLI arg > environment variable (.env) > this file > defaults.
 
 # Rucio scope for all DIDs
 scope: "cms"
@@ -10,26 +14,48 @@ rse: "T2_US_EXAMPLE"
 # POSIX path to the RSE storage root on this host
 rse_mount: "/mnt/rse/T2_US_EXAMPLE"
 
-# Dataset DID prefix — final name: {dataset_prefix}_{date}_{run_id}
+# Dataset DID name.
+#
+# Supports Jinja2 templates.  Available variables:
+#   {{ date }}           UTC date, YYYYMMDD
+#   {{ datetime }}       UTC datetime, YYYYMMDD_HHMMSS
+#   {{ timestamp }}      UTC Unix timestamp (integer)
+#   {{ run_id }}         12-char hex run identifier
+#   {{ scope }}          Rucio scope
+#   {{ rse }}            Target RSE name
+#   {{ num_files }}      Number of files (integer)
+#   {{ file_size }}      Human-readable file size (e.g. 1GiB, 512MiB)
+#   {{ file_size_bytes}} Raw file size in bytes
+#   {{ dataset_prefix }} Dataset prefix string
+#
+# Option A — static name (same dataset reused across runs; files are appended):
+#   dataset_name: "my_test_dataset"
+#
+# Option B — template name:
+#   dataset_name: "{{ dataset_prefix }}_{{ rse }}_{{ date }}"
+#
+# Option C — dynamic name (default; unique per run):
+#   dataset_prefix defines the stem; final name is {prefix}_{YYYYMMDD}_{run_id}
 dataset_prefix: "testdataset"
+# dataset_name: ~
 
 # File LFN prefix — final filename: {prefix}_{adler32hex}
+# Also supports Jinja2 templates (same variables as dataset_name above,
+# except dataset_prefix). Note: {{ timestamp }} is evaluated once at
+# startup and cached for the entire run, so all files share the same prefix.
 file_prefix: "testfile"
+# file_prefix: "{{ scope }}_{{ file_size }}_test"
 
 # Number of files to generate per run
 num_files: 10
 
-# Size of each generated file in bytes (e.g. 1 GiB)
-file_size_bytes: 1073741824
-
-# OIDC client credentials
-token_endpoint: "https://iam.example.org/token"
-client_id: "my-client-id"
-client_secret: "my-client-secret"
-
-# Rucio server URL
-rucio_host: "https://rucio.example.org"
-rucio_auth_host: "https://rucio-auth.example.org"
+# Size of each generated file.
+# Accepts a raw integer (bytes) or a human-readable string.
+# SI units (decimal, powers of 1000): KB = 10³, MB = 10⁶, GB = 10⁹, TB = 10¹², PB = 10¹⁵
+# IEC units (binary, powers of 1024): KiB = 1024, MiB = 1024², GiB = 1024³, TiB = 1024⁴
+# Bare letters (K, M, G, T, P) are treated as binary (IEC).
+# Examples: 1073741824  1GiB  512MiB  1GB  512MB  2TiB  500GB
+file_size_bytes: 1GiB
 
 # Pool A: file generation thread count (CPU/IO bound)
 threads: 4
@@ -37,6 +63,42 @@ threads: 4
 # Replication rule lifetime in seconds. Omit or set to null for a permanent rule.
 # Examples: 604800 = 7 days, 2592000 = 30 days
 rule_lifetime: ~
+
+# Staging directory for file creation.  Files are written here first, then
+# moved to the RSE.  May be on a different filesystem from rse_mount (a
+# shutil.copy2 + os.rename sequence is used automatically in that case).
+# Default: system temp dir (tempfile.gettempdir()).
+# staging_dir: /scratch/rucio-staging
+
+# Path prefix that Rucio uses for this RSE's PFNs.  If Rucio returns PFNs
+# like /data/rucio/cms/ab/cd/file but the RSE is mounted at /mnt/rse, set:
+#   rse_pfn_prefix: /data/rucio
+#   rse_mount:      /mnt/rse
+# The tool strips rse_pfn_prefix and prepends rse_mount to get the local path.
+# Omit (or null) if Rucio already returns paths that are valid locally.
+# rse_pfn_prefix: ~
+
+# RSE file ownership.  Omit (or set to null) to keep the process's own uid/gid.
+# Set these when the Rucio storage account has a different uid/gid than the user
+# running this tool, e.g. when running as root and writing files owned by rucio.
+# The tool will also chown any intermediate hash directories it creates.
+# rse_uid: 1000
+# rse_gid: 1000
+
+# Container DID name.  If set, each generated dataset is attached to this
+# Rucio container after a successful run.  The container is created
+# automatically if it does not already exist.  Attaching a dataset that is
+# already a member of the container is silently ignored (safe to re-run).
+# Supports the same Jinja2 template variables as dataset_name.
+# Omit (or set to null) to skip container attachment entirely.
+# container_name: "my_test_container"
+# container_name: "{{ scope }}_{{ rse }}_tests"
+
+# Global dataset registry.  After each successful run the dataset DID, RSE,
+# rule ID, and cumulative file count are written here.  Set to empty string or
+# null to disable registry recording entirely.
+# Default: ~/.rucio-ds-generator/registry.json
+# registry_file: ~/.rucio-ds-generator/registry.json
 
 # Logging level: DEBUG, INFO, WARNING, ERROR
 log_level: "INFO"

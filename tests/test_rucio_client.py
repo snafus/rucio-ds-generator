@@ -232,7 +232,7 @@ class TestRetry:
         with pytest.raises(requests.ConnectionError):
             manager._retry(fn, "delay-test")
 
-        delays = [c.args[0] for c in mock_sleep.call_args_list]
+        delays = [c[0][0] for c in mock_sleep.call_args_list]  # c[0] = positional args tuple; .args only exists in Python 3.8+
         assert delays == list(RETRY_DELAYS[: MAX_RETRIES - 1])
 
 
@@ -425,6 +425,23 @@ class TestAddReplicationRule:
             assert result is None
             mock_cls.assert_not_called()
 
+    @patch("dataset_generator.rucio_client.requests.post")
+    def test_duplicate_rule_returns_none_with_warning(self, mock_post, config):
+        """DuplicateRule on a static dataset should warn, not fail."""
+        mock_post.return_value = _make_token_response()
+
+        class DuplicateRule(Exception):
+            pass
+
+        mock_client = MagicMock()
+        mock_client.add_replication_rule.side_effect = DuplicateRule("duplicate")
+
+        manager = _make_manager(config)
+        with patch("dataset_generator.rucio_client.Client", return_value=mock_client):
+            result = manager.add_replication_rule("test", "my_ds", "TEST_RSE")
+
+        assert result is None   # not an error
+
 
 # ---------------------------------------------------------------------------
 # lfns2pfn
@@ -454,3 +471,212 @@ class TestLfns2pfn:
         with patch("dataset_generator.rucio_client.Client", return_value=mock_client):
             with pytest.raises(RuntimeError, match="lfns2pfns returned no entry"):
                 manager.lfns2pfn("TEST_RSE", "test:myfile")
+
+
+# ---------------------------------------------------------------------------
+# check_auth
+# ---------------------------------------------------------------------------
+
+class TestCheckAuth:
+    @patch("dataset_generator.rucio_client.requests.post")
+    def test_returns_whoami_dict(self, mock_post, config):
+        mock_post.return_value = _make_token_response()
+        mock_client = MagicMock()
+        mock_client.whoami.return_value = {
+            "account": "robot",
+            "status": "ACTIVE",
+            "account_type": "SERVICE",
+        }
+
+        manager = _make_manager(config)
+        with patch("dataset_generator.rucio_client.Client", return_value=mock_client):
+            result = manager.check_auth()
+
+        mock_client.whoami.assert_called_once_with()
+        assert result["account"] == "robot"
+        assert result["status"] == "ACTIVE"
+
+    @patch("dataset_generator.rucio_client.requests.post")
+    def test_oidc_failure_raises(self, mock_post, config):
+        mock_post.side_effect = requests.RequestException("connection refused")
+
+        manager = _make_manager(config)
+        with pytest.raises(RuntimeError, match="OIDC token request"):
+            manager.check_auth()
+
+    @patch("dataset_generator.rucio_client.requests.post")
+    def test_rucio_failure_raises(self, mock_post, config):
+        mock_post.return_value = _make_token_response()
+        mock_client = MagicMock()
+        mock_client.whoami.side_effect = Exception("ServiceUnavailable")
+
+        manager = _make_manager(config)
+        with patch("dataset_generator.rucio_client.Client", return_value=mock_client):
+            with pytest.raises(Exception, match="ServiceUnavailable"):
+                manager.check_auth()
+
+
+# ---------------------------------------------------------------------------
+# assert_rse_deterministic
+# ---------------------------------------------------------------------------
+
+class TestAssertRseDeterministic:
+    @patch("dataset_generator.rucio_client.requests.post")
+    def test_passes_for_deterministic_rse(self, mock_post, config):
+        mock_post.return_value = _make_token_response()
+        mock_client = MagicMock()
+        mock_client.get_rse.return_value = {"deterministic": True, "rse": "TEST_RSE"}
+
+        manager = _make_manager(config)
+        with patch("dataset_generator.rucio_client.Client", return_value=mock_client):
+            manager.assert_rse_deterministic("TEST_RSE")  # must not raise
+
+        mock_client.get_rse.assert_called_once_with("TEST_RSE")
+
+    @patch("dataset_generator.rucio_client.requests.post")
+    def test_raises_for_non_deterministic_rse(self, mock_post, config):
+        mock_post.return_value = _make_token_response()
+        mock_client = MagicMock()
+        mock_client.get_rse.return_value = {"deterministic": False, "rse": "TEST_RSE"}
+
+        manager = _make_manager(config)
+        with patch("dataset_generator.rucio_client.Client", return_value=mock_client):
+            with pytest.raises(RuntimeError, match="not deterministic"):
+                manager.assert_rse_deterministic("TEST_RSE")
+
+    def test_dry_run_skips_check(self, config):
+        manager = _make_manager(config, dry_run=True)
+        with patch("dataset_generator.rucio_client.Client") as mock_cls:
+            manager.assert_rse_deterministic("TEST_RSE")
+            mock_cls.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# TestAddContainer
+# ---------------------------------------------------------------------------
+
+class TestAddContainer:
+    @patch("dataset_generator.rucio_client.requests.post")
+    def test_creates_container(self, mock_post, config):
+        mock_post.return_value = _make_token_response()
+        mock_client = MagicMock()
+        manager = _make_manager(config)
+        with patch("dataset_generator.rucio_client.Client", return_value=mock_client):
+            manager.add_container("test", "my_container")
+        mock_client.add_container.assert_called_once_with(scope="test", name="my_container")
+
+    @patch("dataset_generator.rucio_client.requests.post")
+    def test_already_exists_does_not_raise(self, mock_post, config):
+        mock_post.return_value = _make_token_response()
+        mock_client = MagicMock()
+
+        class DataIdentifierAlreadyExists(Exception):
+            pass
+
+        mock_client.add_container.side_effect = DataIdentifierAlreadyExists("exists")
+        manager = _make_manager(config)
+        with patch("dataset_generator.rucio_client.Client", return_value=mock_client):
+            manager.add_container("test", "my_container")  # must not raise
+
+    def test_dry_run_skips_call(self, config):
+        manager = _make_manager(config, dry_run=True)
+        with patch("dataset_generator.rucio_client.Client") as mock_cls:
+            manager.add_container("test", "my_container")
+            mock_cls.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# TestAttachDatasetToContainer
+# ---------------------------------------------------------------------------
+
+class TestAttachDatasetToContainer:
+    @patch("dataset_generator.rucio_client.requests.post")
+    def test_attaches_dataset(self, mock_post, config):
+        mock_post.return_value = _make_token_response()
+        mock_client = MagicMock()
+        manager = _make_manager(config)
+        with patch("dataset_generator.rucio_client.Client", return_value=mock_client):
+            manager.attach_dataset_to_container("test", "my_container", "my_dataset")
+        mock_client.attach_dids.assert_called_once_with(
+            scope="test",
+            name="my_container",
+            dids=[{"scope": "test", "name": "my_dataset"}],
+        )
+
+    @patch("dataset_generator.rucio_client.requests.post")
+    def test_duplicate_content_does_not_raise(self, mock_post, config):
+        mock_post.return_value = _make_token_response()
+        mock_client = MagicMock()
+
+        class DuplicateContent(Exception):
+            pass
+
+        mock_client.attach_dids.side_effect = DuplicateContent("already attached")
+        manager = _make_manager(config)
+        with patch("dataset_generator.rucio_client.Client", return_value=mock_client):
+            # must not raise
+            manager.attach_dataset_to_container("test", "my_container", "my_dataset")
+
+    def test_dry_run_skips_call(self, config):
+        manager = _make_manager(config, dry_run=True)
+        with patch("dataset_generator.rucio_client.Client") as mock_cls:
+            manager.attach_dataset_to_container("test", "my_container", "my_dataset")
+            mock_cls.assert_not_called()
+
+    @patch("dataset_generator.rucio_client.requests.post")
+    def test_other_exception_propagates(self, mock_post, config):
+        mock_post.return_value = _make_token_response()
+        mock_client = MagicMock()
+        mock_client.attach_dids.side_effect = RuntimeError("unexpected")
+        manager = _make_manager(config)
+        with patch("dataset_generator.rucio_client.Client", return_value=mock_client):
+            with pytest.raises(RuntimeError, match="unexpected"):
+                manager.attach_dataset_to_container("test", "my_container", "my_dataset")
+
+
+# ---------------------------------------------------------------------------
+# TestCountDatasetFiles
+# ---------------------------------------------------------------------------
+
+class TestCountDatasetFiles:
+    @patch("dataset_generator.rucio_client.requests.post")
+    def test_counts_files_in_dataset(self, mock_post, config):
+        mock_post.return_value = _make_token_response()
+        mock_client = MagicMock()
+        mock_client.list_files.return_value = iter([{"name": "f1"}, {"name": "f2"}, {"name": "f3"}])
+        manager = _make_manager(config)
+        with patch("dataset_generator.rucio_client.Client", return_value=mock_client):
+            count = manager.count_dataset_files("cms", "my_dataset")
+        assert count == 3
+        mock_client.list_files.assert_called_once_with(scope="cms", name="my_dataset")
+
+    @patch("dataset_generator.rucio_client.requests.post")
+    def test_returns_zero_for_nonexistent_dataset(self, mock_post, config):
+        mock_post.return_value = _make_token_response()
+        mock_client = MagicMock()
+
+        class DataIdentifierNotFound(Exception):
+            pass
+
+        mock_client.list_files.side_effect = DataIdentifierNotFound("no such DID")
+        manager = _make_manager(config)
+        with patch("dataset_generator.rucio_client.Client", return_value=mock_client):
+            count = manager.count_dataset_files("cms", "missing_dataset")
+        assert count == 0
+
+    def test_dry_run_returns_zero(self, config):
+        manager = _make_manager(config, dry_run=True)
+        with patch("dataset_generator.rucio_client.Client") as mock_cls:
+            count = manager.count_dataset_files("cms", "my_dataset")
+            mock_cls.assert_not_called()
+        assert count == 0
+
+    @patch("dataset_generator.rucio_client.requests.post")
+    def test_empty_dataset_returns_zero(self, mock_post, config):
+        mock_post.return_value = _make_token_response()
+        mock_client = MagicMock()
+        mock_client.list_files.return_value = iter([])
+        manager = _make_manager(config)
+        with patch("dataset_generator.rucio_client.Client", return_value=mock_client):
+            count = manager.count_dataset_files("cms", "empty_dataset")
+        assert count == 0

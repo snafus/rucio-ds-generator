@@ -42,8 +42,10 @@ Rucio API notes (38.3+)
   keys ``scope``, ``name``, ``bytes``, ``adler32``, and optional ``pfn``
   (required for non-deterministic RSEs).
 * ``add_dataset(scope, name)`` — must be called before ``attach_dids``.
+* ``add_container(scope, name)`` — creates a container DID.
 * ``attach_dids(scope, name, dids)`` — ``dids`` is a list of
-  ``{"scope": ..., "name": ...}`` dicts.
+  ``{"scope": ..., "name": ...}`` dicts; works for both datasets→files
+  and containers→datasets.
 * ``add_replication_rule(dids, copies, rse_expression)`` — call on the
   *dataset* DID, not per-file DIDs.
 * ``delete_replicas(rse, files)`` — ``files`` is a list of
@@ -277,6 +279,38 @@ class RucioManager(object):
     # Dataset operations
     # ------------------------------------------------------------------
 
+    def count_dataset_files(self, scope, name):
+        # type: (str, str) -> int
+        """
+        Return the number of files currently attached to the dataset DID.
+
+        Returns ``0`` if the dataset does not yet exist
+        (``DataIdentifierNotFound``).  This is used to determine how many
+        additional files need to be generated to reach ``num_files``.
+
+        Parameters
+        ----------
+        scope:
+            Rucio scope.
+        name:
+            Dataset name component (no scope prefix).
+        """
+        if self._dry_run:
+            log.info("[DRY-RUN] Skipping file count for %r:%r — returning 0", scope, name)
+            return 0
+
+        client = self._make_client()
+
+        def _call():
+            try:
+                return sum(1 for _ in client.list_files(scope=scope, name=name))
+            except Exception as exc:
+                if "DataIdentifierNotFound" in type(exc).__name__:
+                    return 0
+                raise
+
+        return self._retry(_call, "count_dataset_files({!r}:{!r})".format(scope, name))
+
     def add_dataset(self, scope, name):
         # type: (str, str) -> None
         """
@@ -310,6 +344,92 @@ class RucioManager(object):
                     raise
 
         self._retry(_call, "add_dataset({!r}:{!r})".format(scope, name))
+
+    def add_container(self, scope, name):
+        # type: (str, str) -> None
+        """
+        Create a Rucio container DID.
+
+        If the container already exists (``DataIdentifierAlreadyExists``) the
+        exception is silently ignored — the run continues normally.
+
+        Parameters
+        ----------
+        scope:
+            Rucio scope.
+        name:
+            Container name (without scope prefix).
+        """
+        if self._dry_run:
+            log.info("[DRY-RUN] add_container(%r, %r)", scope, name)
+            return
+
+        client = self._make_client()
+
+        def _call():
+            try:
+                client.add_container(scope=scope, name=name)
+                log.info("Created container DID: %s:%s", scope, name)
+            except Exception as exc:
+                if "DataIdentifierAlreadyExists" in type(exc).__name__:
+                    log.debug("Container %s:%s already exists — continuing", scope, name)
+                else:
+                    raise
+
+        self._retry(_call, "add_container({!r}:{!r})".format(scope, name))
+
+    def attach_dataset_to_container(self, scope, container_name, dataset_name):
+        # type: (str, str, str) -> None
+        """
+        Attach a dataset DID to a container DID.
+
+        If the dataset is already a member of the container
+        (``DuplicateContent``), the exception is silently ignored.
+
+        Parameters
+        ----------
+        scope:
+            Scope shared by both the container and the dataset.
+        container_name:
+            Container name component (no scope prefix).
+        dataset_name:
+            Dataset name component (no scope prefix) to attach.
+        """
+        if self._dry_run:
+            log.info(
+                "[DRY-RUN] attach_dataset_to_container(%r:%r ← dataset %r)",
+                scope, container_name, dataset_name,
+            )
+            return
+
+        client = self._make_client()
+
+        def _call():
+            try:
+                client.attach_dids(
+                    scope=scope,
+                    name=container_name,
+                    dids=[{"scope": scope, "name": dataset_name}],
+                )
+                log.info(
+                    "Attached dataset %s:%s to container %s:%s",
+                    scope, dataset_name, scope, container_name,
+                )
+            except Exception as exc:
+                if "DuplicateContent" in type(exc).__name__:
+                    log.debug(
+                        "Dataset %s:%s already in container %s:%s — skipping",
+                        scope, dataset_name, scope, container_name,
+                    )
+                else:
+                    raise
+
+        self._retry(
+            _call,
+            "attach_dataset_to_container({!r}:{!r} ← {!r})".format(
+                scope, container_name, dataset_name,
+            ),
+        )
 
     # ------------------------------------------------------------------
     # Replica operations
@@ -423,6 +543,95 @@ class RucioManager(object):
         )
 
     # ------------------------------------------------------------------
+    # RSE checks
+    # ------------------------------------------------------------------
+
+    def assert_rse_deterministic(self, rse):
+        # type: (str) -> None
+        """
+        Assert that *rse* is a deterministic RSE, raising ``RuntimeError`` if not.
+
+        Deterministic RSEs derive the PFN from the LFN using a fixed path
+        scheme — no explicit PFN should be passed to ``add_replicas``.
+        Non-deterministic RSEs require an explicit PFN for each replica, which
+        this tool does not support.
+
+        The check is a single lightweight ``get_rse`` call and is performed
+        once at startup (before any file generation) so the pipeline fails
+        fast rather than after writing files.
+
+        Parameters
+        ----------
+        rse:
+            RSE name.
+
+        Raises
+        ------
+        RuntimeError
+            If the RSE is not deterministic or the query fails.
+        """
+        if self._dry_run:
+            log.info("[DRY-RUN] Skipping RSE deterministic check for %r", rse)
+            return
+
+        client = self._make_client()
+
+        def _call():
+            info = client.get_rse(rse)
+            if not info.get("deterministic", False):
+                raise RuntimeError(
+                    "RSE {!r} is not deterministic. This tool only supports "
+                    "deterministic RSEs (PFN derived from LFN). "
+                    "Non-deterministic RSEs require explicit PFNs which are "
+                    "protocol-specific and not supported here.".format(rse)
+                )
+            log.debug("RSE %r confirmed deterministic", rse)
+
+        self._retry(_call, "get_rse({!r})".format(rse))
+
+    # ------------------------------------------------------------------
+    # Auth check
+    # ------------------------------------------------------------------
+
+    def check_auth(self):
+        # type: () -> dict
+        """
+        Verify OIDC token acquisition and Rucio server connectivity.
+
+        1. Fetches a fresh OIDC token (raises ``RuntimeError`` on failure).
+        2. Calls ``whoami()`` on the Rucio server — a lightweight, read-only
+           endpoint that returns the authenticated account info dict.
+
+        Returns
+        -------
+        dict
+            Rucio account info, e.g.
+            ``{"account": "robot", "status": "ACTIVE", ...}``.
+
+        Raises
+        ------
+        RuntimeError
+            If the OIDC token grant fails.
+        Exception
+            If the Rucio ``whoami()`` call fails after all retries.
+        """
+        log.debug("Fetching OIDC token …")
+        self._get_token()   # raises on OIDC failure
+        log.debug("OIDC token acquired — testing Rucio connectivity …")
+
+        client = self._make_client()
+
+        def _call():
+            return client.whoami()
+
+        info = self._retry(_call, "whoami()")
+        log.info(
+            "Auth OK: account=%r status=%r",
+            info.get("account"), info.get("status"),
+        )
+        return info
+
+    # ------------------------------------------------------------------
     # Replication rule
     # ------------------------------------------------------------------
 
@@ -463,13 +672,22 @@ class RucioManager(object):
         did = {"scope": scope, "name": dataset_name}
 
         def _call():
-            rule_ids = client.add_replication_rule(
-                dids=[did],
-                copies=copies,
-                rse_expression=rse,
-                grouping="DATASET",
-                lifetime=lifetime,
-            )
+            try:
+                rule_ids = client.add_replication_rule(
+                    dids=[did],
+                    copies=copies,
+                    rse_expression=rse,
+                    grouping="DATASET",
+                    lifetime=lifetime,
+                )
+            except Exception as exc:
+                if "DuplicateRule" in type(exc).__name__:
+                    log.warning(
+                        "Replication rule for %s:%s → %s already exists — skipping",
+                        scope, dataset_name, rse,
+                    )
+                    return None
+                raise
             rule_id = rule_ids[0] if isinstance(rule_ids, (list, tuple)) else rule_ids
             log.info(
                 "Created replication rule %s on %s:%s → %s",

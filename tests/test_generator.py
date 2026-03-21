@@ -7,6 +7,7 @@ The RucioManager is mocked: lfns2pfn returns a deterministic path based on
 the LFN, matching how a POSIX-mounted deterministic RSE would behave.
 """
 
+import errno
 import os
 import zlib
 from unittest.mock import MagicMock, patch, call
@@ -17,6 +18,8 @@ from dataset_generator.config import Config
 from dataset_generator.generator import (
     CHUNK_SIZE,
     _generate_one,
+    _makedirs_chown,
+    _pfn_to_local,
     _place_file,
     _state_key,
     _write_file,
@@ -38,7 +41,10 @@ def rse_mount(tmp_path):
 
 
 @pytest.fixture
-def config(rse_mount):
+def config(rse_mount, tmp_path):
+    # Each test gets its own unique staging subdir, mirroring what main() does.
+    staging = str(tmp_path / "staging")
+    os.makedirs(staging)
     return Config(
         scope="test",
         rse="TEST_RSE",
@@ -55,6 +61,8 @@ def config(rse_mount):
         rucio_account="acct",
         run_id="test000000",
         dry_run=False,
+        staging_dir=staging,
+        # rse_pfn_prefix=None: mock_rucio returns paths under rse_mount directly
     )
 
 
@@ -153,6 +161,47 @@ class TestWriteFile:
 # _place_file
 # ---------------------------------------------------------------------------
 
+class TestMakedirsChown:
+    def test_creates_nested_dirs(self, tmp_path):
+        target = str(tmp_path / "a" / "b" / "c")
+        _makedirs_chown(target, uid=None, gid=None)
+        assert os.path.isdir(target)
+
+    def test_idempotent_when_dir_exists(self, tmp_path):
+        target = str(tmp_path / "exists")
+        os.makedirs(target)
+        _makedirs_chown(target, uid=None, gid=None)  # should not raise
+        assert os.path.isdir(target)
+
+    def test_chown_called_for_new_dirs_only(self, tmp_path):
+        existing = tmp_path / "existing"
+        existing.mkdir()
+        target = str(existing / "new1" / "new2")
+
+        with patch("os.chown") as mock_chown:
+            _makedirs_chown(target, uid=1000, gid=2000)
+
+        # Only the two new dirs should be chowned, not the pre-existing one
+        chowned_paths = [c[0][0] for c in mock_chown.call_args_list]
+        assert str(existing / "new1") in chowned_paths
+        assert target in chowned_paths
+        assert str(existing) not in chowned_paths
+
+    def test_chown_not_called_when_uid_gid_none(self, tmp_path):
+        target = str(tmp_path / "d1" / "d2")
+        with patch("os.chown") as mock_chown:
+            _makedirs_chown(target, uid=None, gid=None)
+        mock_chown.assert_not_called()
+
+    def test_uid_only_uses_minus1_for_gid(self, tmp_path):
+        target = str(tmp_path / "d")
+        with patch("os.chown") as mock_chown:
+            _makedirs_chown(target, uid=500, gid=None)
+        for c in mock_chown.call_args_list:
+            assert c[0][1] == 500   # uid
+            assert c[0][2] == -1    # gid unchanged
+
+
 class TestPlaceFile:
     def test_creates_parent_dirs(self, tmp_path):
         tmp_file = str(tmp_path / "source.tmp")
@@ -173,6 +222,143 @@ class TestPlaceFile:
         _place_file(tmp_file, final)
         with open(final, "rb") as fh:
             assert fh.read() == b"data"
+
+    def test_chown_applied_to_part_file_before_rename(self, tmp_path):
+        tmp_file = str(tmp_path / "src.tmp")
+        with open(tmp_file, "wb") as fh:
+            fh.write(b"x")
+        final = str(tmp_path / "dst.dat")
+        chowned = []
+        real_chown = os.chown
+        def capture_chown(path, uid, gid):
+            chowned.append((path, uid, gid))
+        with patch("os.chown", side_effect=capture_chown):
+            with patch("dataset_generator.generator._makedirs_chown"):
+                _place_file(tmp_file, final, uid=42, gid=99)
+        # chown must have been called on a .part path, not the final path
+        assert len(chowned) == 1
+        part_path, uid_arg, gid_arg = chowned[0]
+        assert ".part." in part_path
+        assert uid_arg == 42
+        assert gid_arg == 99
+        # Final file exists and staging is gone
+        assert os.path.exists(final)
+        assert not os.path.exists(tmp_file)
+
+    def test_no_chown_when_uid_gid_none(self, tmp_path):
+        tmp_file = str(tmp_path / "src.tmp")
+        with open(tmp_file, "wb") as fh:
+            fh.write(b"x")
+        final = str(tmp_path / "dst.dat")
+        with patch("os.chown") as mock_chown:
+            _place_file(tmp_file, final, uid=None, gid=None)
+        mock_chown.assert_not_called()
+
+    def test_cross_filesystem_falls_back_to_copy(self, tmp_path):
+        tmp_file = str(tmp_path / "src.tmp")
+        with open(tmp_file, "wb") as fh:
+            fh.write(b"crossfs")
+        final = str(tmp_path / "dst.dat")
+        exdev = OSError()
+        exdev.errno = errno.EXDEV
+        # First rename raises EXDEV (cross-fs); subsequent ones succeed normally
+        rename_calls = [0]
+        real_rename = os.rename
+        def patched_rename(src, dst):
+            if rename_calls[0] == 0:
+                rename_calls[0] += 1
+                raise exdev
+            return real_rename(src, dst)
+        with patch("os.rename", side_effect=patched_rename):
+            _place_file(tmp_file, final)
+        assert os.path.exists(final)
+        with open(final, "rb") as fh:
+            assert fh.read() == b"crossfs"
+
+    def test_part_file_cleaned_up_on_final_rename_failure(self, tmp_path):
+        """If the final rename (.part → final) fails, the .part file must be removed."""
+        tmp_file = str(tmp_path / "src.tmp")
+        with open(tmp_file, "wb") as fh:
+            fh.write(b"data")
+        final = str(tmp_path / "dst.dat")
+
+        real_rename = os.rename
+        rename_calls = [0]
+        def patched_rename(src, dst):
+            rename_calls[0] += 1
+            if rename_calls[0] == 1:
+                # First rename: staging → .part (let it succeed so the .part exists)
+                return real_rename(src, dst)
+            # Second rename: .part → final — simulate failure
+            raise OSError("simulated rename failure")
+
+        with patch("os.rename", side_effect=patched_rename):
+            with pytest.raises(OSError, match="simulated rename failure"):
+                _place_file(tmp_file, final)
+
+        # Final file must not exist
+        assert not os.path.exists(final)
+        # No .part file should remain in tmp_path
+        leftover = [f for f in os.listdir(str(tmp_path)) if ".part." in f]
+        assert leftover == [], "orphaned .part files: {}".format(leftover)
+
+
+# ---------------------------------------------------------------------------
+# _pfn_to_local
+# ---------------------------------------------------------------------------
+
+class TestPfnToLocal:
+    def test_no_prefix_passthrough(self):
+        assert _pfn_to_local("/data/rucio/cms/ab/file", None, "/mnt/rse") == "/data/rucio/cms/ab/file"
+
+    def test_strips_file_protocol(self):
+        assert _pfn_to_local("file:///data/rucio/cms/ab/file", None, "/mnt/rse") == "/data/rucio/cms/ab/file"
+
+    def test_prefix_replaced_with_mount(self):
+        result = _pfn_to_local("/data/rucio/cms/ab/file", "/data/rucio", "/mnt/rse")
+        assert result == "/mnt/rse/cms/ab/file"
+
+    def test_file_protocol_url_as_prefix(self):
+        # Prefix includes the file:// protocol — matched against raw PFN
+        result = _pfn_to_local("file:///data/rucio/cms/ab/file", "file:///data/rucio", "/mnt/rse")
+        assert result == "/mnt/rse/cms/ab/file"
+
+    def test_davs_url_as_prefix(self):
+        pfn = "davs://storage.example.org:443/rucio/cms/ab/file_abcd1234"
+        result = _pfn_to_local(pfn, "davs://storage.example.org:443/rucio", "/mnt/rse")
+        assert result == "/mnt/rse/cms/ab/file_abcd1234"
+
+    def test_prefix_mismatch_raises(self):
+        with pytest.raises(RuntimeError, match="rse_pfn_prefix"):
+            _pfn_to_local("/other/path/file", "/data/rucio", "/mnt/rse")
+
+    def test_unsupported_protocol_raises(self):
+        with pytest.raises(RuntimeError, match="Unsupported PFN protocol"):
+            _pfn_to_local("gsiftp://storage.example.org/data/file", None, "/mnt/rse")
+
+    def test_unsupported_protocol_with_prefix_succeeds(self):
+        # Any protocol is fine as long as rse_pfn_prefix covers it
+        pfn = "gsiftp://storage.example.org:2811/rucio/cms/ab/file"
+        result = _pfn_to_local(pfn, "gsiftp://storage.example.org:2811/rucio", "/mnt/rse")
+        assert result == "/mnt/rse/cms/ab/file"
+
+    def test_trailing_slash_on_prefix(self):
+        # rse_pfn_prefix with trailing slash: suffix loses its leading '/';
+        # _pfn_to_local must re-add it to avoid "/mnt/rsecms/..." concatenation.
+        pfn = "/data/rucio/cms/ab/file"
+        result = _pfn_to_local(pfn, "/data/rucio/", "/mnt/rse")
+        assert result == "/mnt/rse/cms/ab/file"
+
+    def test_trailing_slash_on_mount(self):
+        # rse_mount with trailing slash must not produce double '//'
+        pfn = "/data/rucio/cms/ab/file"
+        result = _pfn_to_local(pfn, "/data/rucio", "/mnt/rse/")
+        assert result == "/mnt/rse/cms/ab/file"
+
+    def test_trailing_slash_on_both(self):
+        pfn = "/data/rucio/cms/ab/file"
+        result = _pfn_to_local(pfn, "/data/rucio/", "/mnt/rse/")
+        assert result == "/mnt/rse/cms/ab/file"
 
 
 # ---------------------------------------------------------------------------
@@ -303,3 +489,26 @@ class TestRunGeneration:
         config.dry_run = True
         results = run_generation(config, state, mock_rucio)
         assert len(results) == config.num_files
+
+    def test_new_count_additive(self, config, state, mock_rucio, rse_mount):
+        """new_count generates that many files on top of the existing state."""
+        # Simulate 2 files already CREATED in a previous run
+        for idx in range(2):
+            key = _state_key(idx)
+            state.allocate(key)
+            state.update(key, status=FileStatus.CREATED, lfn="test:x",
+                         lfn_name="x", pfn="/p/x", bytes=512, adler32="deadbeef")
+
+        # Generate 1 more (new_count=1) → total managed = 2+1 = 3
+        results = run_generation(config, state, mock_rucio, new_count=1)
+        assert len(results) == 3   # 2 already done + 1 new
+
+    def test_new_count_zero_skips_generation(self, config, state, mock_rucio, rse_mount):
+        """new_count=0 returns existing CREATED entries without generating more."""
+        # Pre-populate state with CREATED entries
+        run_generation(config, state, mock_rucio)
+        call_count_before = mock_rucio.lfns2pfn.call_count
+
+        results = run_generation(config, state, mock_rucio, new_count=0)
+        assert len(results) == config.num_files
+        assert mock_rucio.lfns2pfn.call_count == call_count_before  # no new calls

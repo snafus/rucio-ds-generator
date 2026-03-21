@@ -132,6 +132,65 @@ class FakeArgs(object):
         self.__dict__.update(kwargs)
 
 
+class TestEnvVarLookup:
+    """Environment variables supply credentials between CLI and YAML in precedence."""
+
+    def test_env_var_supplies_missing_value(self, monkeypatch, tmp_path):
+        yaml_content = (
+            "scope: cms\nrse: T2\nrse_mount: /tmp\ndataset_prefix: ds\n"
+            "file_prefix: f\nnum_files: 1\nfile_size_bytes: 512\n"
+            "token_endpoint: https://iam/token\nclient_id: cid\nclient_secret: s\n"
+            "rucio_host: https://rucio\nrucio_auth_host: https://rucio-auth\n"
+            "rucio_account: fromyaml\n"
+        )
+        yaml_file = tmp_path / "c.yaml"
+        yaml_file.write_text(yaml_content)
+        monkeypatch.setenv("RUCIO_ACCOUNT", "from_env")
+        cfg = Config.from_yaml_and_args(str(yaml_file), FakeArgs())
+        assert cfg.rucio_account == "from_env"   # env wins over YAML
+
+    def test_cli_beats_env_var(self, monkeypatch, tmp_path):
+        yaml_content = (
+            "scope: cms\nrse: T2\nrse_mount: /tmp\ndataset_prefix: ds\n"
+            "file_prefix: f\nnum_files: 1\nfile_size_bytes: 512\n"
+            "token_endpoint: https://iam/token\nclient_id: cid\nclient_secret: s\n"
+            "rucio_host: https://rucio\nrucio_auth_host: https://rucio-auth\n"
+            "rucio_account: fromyaml\n"
+        )
+        yaml_file = tmp_path / "c.yaml"
+        yaml_file.write_text(yaml_content)
+        monkeypatch.setenv("RUCIO_ACCOUNT", "from_env")
+        cfg = Config.from_yaml_and_args(str(yaml_file), FakeArgs(rucio_account="from_cli"))
+        assert cfg.rucio_account == "from_cli"   # CLI beats env var
+
+    def test_oidc_env_vars_mapped(self, monkeypatch, tmp_path):
+        yaml_content = (
+            "scope: cms\nrse: T2\nrse_mount: /tmp\ndataset_prefix: ds\n"
+            "file_prefix: f\nnum_files: 1\nfile_size_bytes: 512\n"
+            "rucio_host: https://rucio\nrucio_auth_host: https://rucio-auth\n"
+            "rucio_account: acct\n"
+        )
+        yaml_file = tmp_path / "c.yaml"
+        yaml_file.write_text(yaml_content)
+        monkeypatch.setenv("OIDC_TOKEN_ENDPOINT", "https://env-iam/token")
+        monkeypatch.setenv("OIDC_CLIENT_ID", "env-cid")
+        monkeypatch.setenv("OIDC_CLIENT_SECRET", "env-secret")
+        cfg = Config.from_yaml_and_args(str(yaml_file), FakeArgs())
+        assert cfg.token_endpoint == "https://env-iam/token"
+        assert cfg.client_id == "env-cid"
+        assert cfg.client_secret == "env-secret"
+
+    def test_error_message_names_env_var(self, tmp_path):
+        yaml_file = tmp_path / "c.yaml"
+        yaml_file.write_text("scope: cms\n")
+        with pytest.raises(ConfigError, match="RUCIO_HOST"):
+            Config.from_yaml_and_args(str(yaml_file), FakeArgs(scope="cms", rse="R",
+                rse_mount="/tmp", dataset_prefix="d", file_prefix="f",
+                num_files=1, file_size_bytes=512, rucio_account="a",
+                rucio_auth_host="h", token_endpoint="t",
+                client_id="c", client_secret="s"))
+
+
 class TestFromYamlAndArgs:
     def test_yaml_only(self, tmp_path):
         yaml_content = textwrap.dedent("""\
@@ -295,3 +354,281 @@ class TestRepr:
         assert "abc123" in r
         assert "test_scope" in r
         assert "TEST_RSE" in r
+
+
+# ---------------------------------------------------------------------------
+# Static dataset name
+# ---------------------------------------------------------------------------
+
+class TestDatasetName:
+    def test_dynamic_name_includes_prefix_date_run_id(self):
+        cfg = _make_config(dataset_prefix="myds", run_id="aabbccddeeff")
+        parts = cfg.dataset_name.split("_")
+        assert parts[0] == "myds"
+        assert len(parts[1]) == 8   # YYYYMMDD
+        assert parts[2] == "aabbccddeeff"
+
+    def test_static_name_returned_verbatim(self):
+        cfg = _make_config(dataset_name="my_fixed_dataset")
+        assert cfg.dataset_name == "my_fixed_dataset"
+
+    def test_static_name_in_dataset_did(self):
+        cfg = _make_config(scope="cms", dataset_name="my_fixed_dataset")
+        assert cfg.dataset_did == "cms:my_fixed_dataset"
+
+    def test_static_name_makes_dataset_prefix_optional(self):
+        # dataset_prefix may be absent when dataset_name is set
+        from dataset_generator.config import Config
+        import textwrap, tempfile, os
+        cfg = Config.from_yaml_and_args(None, FakeArgs(
+            scope="cms", rse="RSE", rse_mount="/tmp",
+            file_prefix="f", num_files=1, file_size_bytes=512,
+            token_endpoint="https://t", client_id="c", client_secret="s",
+            rucio_host="https://r", rucio_auth_host="https://ra",
+            rucio_account="a", dataset_name="fixed",
+        ))
+        assert cfg.dataset_name == "fixed"
+
+
+# ---------------------------------------------------------------------------
+# TestNamingTemplates
+# ---------------------------------------------------------------------------
+
+class TestNamingTemplates:
+    """Jinja2 template rendering for dataset_name, file_prefix, container_name."""
+
+    def _cfg(self, **kwargs):
+        defaults = dict(
+            scope="cms", rse="T2_US_TEST", rse_mount="/tmp",
+            dataset_prefix="ds", file_prefix="file",
+            num_files=2, file_size_bytes=1073741824,
+            token_endpoint="https://t", client_id="c", client_secret="s",
+            rucio_host="https://r", rucio_auth_host="https://ra",
+            rucio_account="a", run_id="aabbccddeeff",
+        )
+        defaults.update(kwargs)
+        return Config(**defaults)
+
+    # ------------------------------------------------------------------
+    # Plain strings pass through unchanged
+    # ------------------------------------------------------------------
+
+    def test_plain_file_prefix_unchanged(self):
+        cfg = self._cfg(file_prefix="testfile")
+        assert cfg.file_prefix == "testfile"
+
+    def test_plain_dataset_name_unchanged(self):
+        cfg = self._cfg(dataset_name="my_dataset")
+        assert cfg.dataset_name == "my_dataset"
+
+    def test_plain_container_name_unchanged(self):
+        cfg = self._cfg(container_name="my_container")
+        assert cfg.container_name == "my_container"
+
+    # ------------------------------------------------------------------
+    # run_id
+    # ------------------------------------------------------------------
+
+    def test_file_prefix_run_id(self):
+        cfg = self._cfg(file_prefix="file_{{ run_id }}")
+        assert cfg.file_prefix == "file_aabbccddeeff"
+
+    def test_dataset_name_run_id(self):
+        cfg = self._cfg(dataset_name="{{ dataset_prefix }}_{{ run_id }}")
+        assert cfg.dataset_name == "ds_aabbccddeeff"
+
+    def test_container_name_run_id(self):
+        cfg = self._cfg(container_name="ctr_{{ run_id }}")
+        assert cfg.container_name == "ctr_aabbccddeeff"
+
+    # ------------------------------------------------------------------
+    # scope and rse
+    # ------------------------------------------------------------------
+
+    def test_file_prefix_scope(self):
+        cfg = self._cfg(file_prefix="{{ scope }}_dummy")
+        assert cfg.file_prefix == "cms_dummy"
+
+    def test_dataset_name_rse(self):
+        cfg = self._cfg(dataset_name="{{ dataset_prefix }}_{{ rse }}")
+        assert cfg.dataset_name == "ds_T2_US_TEST"
+
+    def test_container_name_scope_rse(self):
+        cfg = self._cfg(container_name="{{ scope }}_{{ rse }}_tests")
+        assert cfg.container_name == "cms_T2_US_TEST_tests"
+
+    # ------------------------------------------------------------------
+    # file_size (human-readable)
+    # ------------------------------------------------------------------
+
+    def test_file_prefix_file_size(self):
+        cfg = self._cfg(file_prefix="f_{{ file_size }}", file_size_bytes=1073741824)
+        assert cfg.file_prefix == "f_1GiB"
+
+    def test_dataset_name_file_size(self):
+        cfg = self._cfg(dataset_name="{{ dataset_prefix }}_{{ file_size }}",
+                        file_size_bytes=536870912)
+        assert cfg.dataset_name == "ds_512MiB"
+
+    # ------------------------------------------------------------------
+    # date / datetime variables present and correct format
+    # ------------------------------------------------------------------
+
+    def test_date_variable_format(self):
+        from datetime import datetime, timezone
+        cfg = self._cfg(dataset_name="{{ date }}")
+        expected = datetime.now(timezone.utc).strftime("%Y%m%d")
+        assert cfg.dataset_name == expected
+
+    def test_datetime_variable_format(self):
+        import re
+        cfg = self._cfg(dataset_name="{{ datetime }}")
+        assert re.match(r"^\d{8}_\d{6}$", cfg.dataset_name)
+
+    def test_timestamp_is_integer_string(self):
+        cfg = self._cfg(dataset_name="{{ timestamp }}")
+        assert cfg.dataset_name.isdigit()
+
+    # ------------------------------------------------------------------
+    # file_size human-readable helper
+    # ------------------------------------------------------------------
+
+    def test_human_size_bytes(self):
+        from dataset_generator.config import _human_size
+        assert _human_size(512) == "512B"
+
+    def test_human_size_kib(self):
+        from dataset_generator.config import _human_size
+        assert _human_size(2048) == "2KiB"
+
+    def test_human_size_mib(self):
+        from dataset_generator.config import _human_size
+        assert _human_size(64 * 1024 * 1024) == "64MiB"
+
+    def test_human_size_gib(self):
+        from dataset_generator.config import _human_size
+        assert _human_size(1024 ** 3) == "1GiB"
+
+    def test_human_size_tib(self):
+        from dataset_generator.config import _human_size
+        assert _human_size(1024 ** 4) == "1TiB"
+
+    # ------------------------------------------------------------------
+    # file_prefix cache
+    # ------------------------------------------------------------------
+
+    def test_file_prefix_cached(self):
+        """file_prefix should return the same object on repeated access."""
+        cfg = self._cfg(file_prefix="file_{{ run_id }}")
+        first = cfg.file_prefix
+        second = cfg.file_prefix
+        assert first is second
+
+    def test_invalidate_name_cache_rerenders(self):
+        """invalidate_name_cache causes file_prefix to re-render with new run_id."""
+        cfg = self._cfg(file_prefix="f_{{ run_id }}")
+        _ = cfg.file_prefix  # prime cache with original run_id
+        cfg.run_id = "112233445566"
+        cfg.invalidate_name_cache()
+        assert cfg.file_prefix == "f_112233445566"
+
+    # ------------------------------------------------------------------
+    # Invalid templates raise ConfigError
+    # ------------------------------------------------------------------
+
+    def test_invalid_template_raises_config_error(self):
+        from dataset_generator.config import ConfigError
+        cfg = self._cfg(dataset_name="{{ unclosed")
+        with pytest.raises(ConfigError, match="Template rendering failed"):
+            _ = cfg.dataset_name
+
+    # ------------------------------------------------------------------
+    # num_files and file_size_bytes in context
+    # ------------------------------------------------------------------
+
+    def test_num_files_in_context(self):
+        cfg = self._cfg(dataset_name="{{ num_files }}files", num_files=5)
+        assert cfg.dataset_name == "5files"
+
+    def test_file_size_bytes_in_context(self):
+        cfg = self._cfg(dataset_name="{{ file_size_bytes }}b",
+                        file_size_bytes=1073741824)
+        assert cfg.dataset_name == "1073741824b"
+
+
+# ---------------------------------------------------------------------------
+# TestParseSize
+# ---------------------------------------------------------------------------
+
+class TestParseSize:
+    """_parse_size accepts raw integers and human-readable strings."""
+
+    def setup_method(self):
+        from dataset_generator.config import _parse_size
+        self.parse = _parse_size
+
+    def test_plain_int(self):
+        assert self.parse(1073741824) == 1073741824
+
+    def test_plain_int_string(self):
+        assert self.parse("1073741824") == 1073741824
+
+    def test_gib(self):
+        assert self.parse("1GiB") == 1024 ** 3
+
+    def test_gib_with_space(self):
+        assert self.parse("1 GiB") == 1024 ** 3
+
+    def test_gb_si(self):
+        # SI: GB = 10^9
+        assert self.parse("1GB") == 1000 ** 3
+
+    def test_mb_si(self):
+        # SI: MB = 10^6
+        assert self.parse("512MB") == 512 * 1000 ** 2
+
+    def test_kb_si(self):
+        # SI: KB = 10^3
+        assert self.parse("64KB") == 64 * 1000
+
+    def test_mib(self):
+        assert self.parse("512MiB") == 512 * 1024 ** 2
+
+    def test_kib(self):
+        assert self.parse("64KiB") == 64 * 1024
+
+    def test_tib(self):
+        assert self.parse("2TiB") == 2 * 1024 ** 4
+
+    def test_bytes_unit(self):
+        assert self.parse("512B") == 512
+
+    def test_case_insensitive(self):
+        assert self.parse("1gib") == 1024 ** 3
+        assert self.parse("1GIB") == 1024 ** 3
+        assert self.parse("1Gib") == 1024 ** 3
+
+    def test_fractional(self):
+        assert self.parse("1.5GiB") == int(1.5 * 1024 ** 3)
+
+    def test_unknown_unit_raises(self):
+        from dataset_generator.config import ConfigError
+        with pytest.raises(ConfigError, match="Unknown size unit"):
+            self.parse("1ZiB")
+
+    def test_bad_format_raises(self):
+        from dataset_generator.config import ConfigError
+        with pytest.raises(ConfigError, match="Cannot parse file size"):
+            self.parse("big")
+
+    def test_config_accepts_human_readable(self):
+        """Config.__init__ resolves human-readable file_size_bytes to int."""
+        cfg = Config(
+            scope="cms", rse="T2", rse_mount="/tmp",
+            dataset_prefix="ds", file_prefix="f",
+            num_files=1, file_size_bytes="1GiB",
+            token_endpoint="https://t", client_id="c", client_secret="s",
+            rucio_host="https://r", rucio_auth_host="https://ra",
+            rucio_account="a",
+        )
+        assert cfg.file_size_bytes == 1024 ** 3

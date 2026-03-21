@@ -294,3 +294,30 @@ class TestFileStatus:
         assert FileStatus.FAILED_REGISTRATION in FileStatus.RETRIABLE
         assert FileStatus.FAILED_RULE in FileStatus.RETRIABLE
         assert FileStatus.RULED not in FileStatus.RETRIABLE
+
+
+# ---------------------------------------------------------------------------
+# TestCount
+# ---------------------------------------------------------------------------
+
+class TestCount:
+    def test_count_zero_on_empty_state(self, tmp_path):
+        from dataset_generator.state import StateFile
+        sf = StateFile(str(tmp_path / "state.json"), run_id="aabbccddeeff")
+        assert sf.count() == 0
+
+    def test_count_reflects_allocated_entries(self, tmp_path):
+        from dataset_generator.state import StateFile
+        sf = StateFile(str(tmp_path / "state.json"), run_id="aabbccddeeff")
+        sf.allocate("file_000000")
+        sf.allocate("file_000001")
+        sf.allocate("file_000002")
+        assert sf.count() == 3
+
+    def test_count_unchanged_by_update(self, tmp_path):
+        from dataset_generator.state import StateFile
+        from dataset_generator.state import FileStatus
+        sf = StateFile(str(tmp_path / "state.json"), run_id="aabbccddeeff")
+        sf.allocate("file_000000")
+        sf.update("file_000000", status=FileStatus.CREATED)
+        assert sf.count() == 1

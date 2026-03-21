@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test-rocky8:
+    name: Test suite (Rocky Linux 8 / Python 3.6)
+    runs-on: ubuntu-latest
+    container:
+      image: rockylinux:8
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          dnf install -y python3 python3-pip python3-devel gcc git
+
+      - name: Upgrade pip
+        run: python3 -m pip install --upgrade "pip<22" "setuptools>=42,<59" wheel
+        # pip 22+ and setuptools 59+ dropped Python 3.6 support
+
+      - name: Install package and test dependencies
+        run: python3 -m pip install -e ".[test]"
+
+      - name: Run tests
+        run: python3 -m pytest tests/ -v --tb=short
+
+  test-rocky9:
+    name: Test suite (Rocky Linux 9 / Python 3.9)
+    runs-on: ubuntu-latest
+    container:
+      image: rockylinux:9
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          dnf install -y python3 python3-pip python3-devel gcc git
+
+      - name: Upgrade pip
+        run: python3 -m pip install --upgrade pip setuptools wheel
+
+      - name: Install package and test dependencies
+        run: python3 -m pip install -e ".[test]"
+
+      - name: Run tests
+        run: python3 -m pytest tests/ -v --tb=short

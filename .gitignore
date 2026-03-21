@@ -40,12 +40,16 @@ coverage.xml
 dmypy.json
 .pytype/
 
-# Secrets and environment files
+# Secrets and environment files — .env.template is committed as a safe placeholder
 .env
 .env.*
+!.env.template
 *.env
 secrets.yaml
 secrets.yml
+
+# Rucio client config — must exist for the Rucio client library; not committed (site-specific)
+rucio.cfg
 
 # State files (contain run-specific data)
 state_*.json

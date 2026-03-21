@@ -1,5 +1,5 @@
 """
-__main__.py — CLI entry point for claude-dataset-generator.
+__main__.py — CLI entry point for rucio-ds-generator.
 
 Usage
 -----
@@ -45,12 +45,19 @@ Exit codes
 """
 
 import argparse
+import atexit
 import logging
 import os
+import shutil
 import sys
+import tempfile
+from typing import Optional
+
+from dotenv import load_dotenv
 
 from .config import Config, ConfigError
 from .generator import run_generation
+from .registry import DatasetRegistry, DEFAULT_REGISTRY_FILE
 from .rucio_client import RucioManager
 from .state import FileStatus, StateFile
 
@@ -104,6 +111,16 @@ def _build_parser():
         ),
     )
 
+    parser.add_argument(
+        "--check-auth", action="store_true", default=False,
+        dest="check_auth",
+        help=(
+            "Test OIDC token acquisition and Rucio connectivity, then exit. "
+            "Exits 0 on success, 2 on any failure. "
+            "Does not require --config if credentials are supplied via env vars."
+        ),
+    )
+
     # Mode flags (mutually exclusive groups checked in Config.validate)
     mode_group = parser.add_argument_group("Operational mode (mutually exclusive)")
     mode_group.add_argument(
@@ -128,11 +145,20 @@ def _build_parser():
     ovr = parser.add_argument_group("Config overrides (override YAML values)")
     ovr.add_argument("--scope", help="Rucio scope.")
     ovr.add_argument("--rse", help="Target RSE name.")
+    ovr.add_argument(
+        "--dataset-name", dest="dataset_name", metavar="NAME",
+        help=(
+            "Fixed dataset DID name (without scope). When set, the same dataset "
+            "is reused across runs (files are appended). "
+            "Default: dynamic {dataset_prefix}_{date}_{run_id}."
+        ),
+    )
     ovr.add_argument("--rse-mount", dest="rse_mount", help="POSIX mount path of RSE storage.")
     ovr.add_argument("--dataset-prefix", dest="dataset_prefix", help="Dataset DID name prefix.")
     ovr.add_argument("--file-prefix", dest="file_prefix", help="File LFN prefix.")
     ovr.add_argument("--num-files", dest="num_files", type=int, help="Number of files to generate.")
-    ovr.add_argument("--file-size-bytes", dest="file_size_bytes", type=int, help="File size in bytes.")
+    ovr.add_argument("--file-size-bytes", dest="file_size_bytes",
+                     help="File size — integer bytes or human-readable: 1GiB, 512MiB, 1GB.")
     ovr.add_argument("--rucio-host", dest="rucio_host", help="Rucio server URL.")
     ovr.add_argument("--rucio-auth-host", dest="rucio_auth_host", help="Rucio auth server URL.")
     ovr.add_argument("--rucio-account", dest="rucio_account", help="Rucio account name.")
@@ -140,10 +166,57 @@ def _build_parser():
     ovr.add_argument("--client-id", dest="client_id", help="OIDC client ID.")
     ovr.add_argument("--client-secret", dest="client_secret", help="OIDC client secret.")
     ovr.add_argument(
+        "--staging-dir", dest="staging_dir", metavar="PATH",
+        help=(
+            "Directory for temporary file creation before placement on the RSE. "
+            "May be on a different filesystem from rse_mount. "
+            "Default: system temp dir (tempfile.gettempdir())."
+        ),
+    )
+    ovr.add_argument(
+        "--rse-pfn-prefix", dest="rse_pfn_prefix", metavar="PREFIX",
+        help=(
+            "Path prefix that Rucio uses for this RSE (e.g. /data/rucio). "
+            "Stripped from Rucio PFNs and replaced with rse_mount to give "
+            "the local filesystem path. Omit if Rucio already returns local paths."
+        ),
+    )
+    ovr.add_argument(
+        "--rse-uid", dest="rse_uid", type=int, metavar="UID",
+        help=(
+            "User ID to assign to placed files and any newly created "
+            "RSE directories. Omit to keep the process's own uid."
+        ),
+    )
+    ovr.add_argument(
+        "--rse-gid", dest="rse_gid", type=int, metavar="GID",
+        help=(
+            "Group ID to assign to placed files and any newly created "
+            "RSE directories. Omit to keep the process's own gid."
+        ),
+    )
+    ovr.add_argument(
         "--rule-lifetime", dest="rule_lifetime", type=int, metavar="SECONDS",
         help=(
             "Replication rule lifetime in seconds. "
             "Omit (or set to null in YAML) for a permanent rule."
+        ),
+    )
+    ovr.add_argument(
+        "--container-name", dest="container_name", metavar="NAME",
+        help=(
+            "Name of a Rucio container DID to attach the dataset to after "
+            "each successful run. The container is created if it does not "
+            "exist; duplicate attachment is silently ignored. "
+            "Omit (or leave unset in YAML) to skip container attachment."
+        ),
+    )
+    ovr.add_argument(
+        "--registry-file", dest="registry_file", metavar="PATH",
+        help=(
+            "Path to the global dataset registry JSON file. "
+            "Default: {}. "
+            "Set to empty string to disable registry recording.".format(DEFAULT_REGISTRY_FILE)
         ),
     )
 
@@ -151,11 +224,70 @@ def _build_parser():
 
 
 # ---------------------------------------------------------------------------
+# Registry helper
+# ---------------------------------------------------------------------------
+
+def _open_registry(config):
+    # type: (Config) -> Optional[DatasetRegistry]
+    """
+    Return an open ``DatasetRegistry``, or ``None`` if registry recording is
+    disabled (``registry_file`` set to empty string or ``"null"``).
+    """
+    rf = config.registry_file
+    if rf is None:
+        rf = DEFAULT_REGISTRY_FILE
+    elif rf.strip().lower() in ("", "null", "none"):
+        log.debug("Registry recording disabled")
+        return None
+    return DatasetRegistry(rf)
+
+
+def _update_registry(config, registry, rule_id, num_files):
+    # type: (Config, Optional[DatasetRegistry], object, int) -> None
+    """Record the dataset in the global registry if recording is enabled."""
+    if registry is None:
+        return
+    try:
+        registry.record(
+            dataset_did=config.dataset_did,
+            rse=config.rse,
+            rule_id=rule_id,
+            num_files=num_files,
+        )
+        log.debug("Registry updated for %s", config.dataset_did)
+    except Exception as exc:
+        log.warning("Failed to update registry: %s", exc)
+
+
+# ---------------------------------------------------------------------------
 # Pipeline stages
 # ---------------------------------------------------------------------------
 
-def _run_full_pipeline(config, state, rucio_manager):
-    # type: (Config, StateFile, RucioManager) -> int
+def _attach_to_container(config, rucio_manager):
+    # type: (Config, RucioManager) -> None
+    """
+    Ensure the container exists and attach the current dataset to it.
+
+    No-op when ``config.container_name`` is not set.  Duplicate attachment
+    is silently ignored by ``RucioManager.attach_dataset_to_container``.
+    """
+    if not config.container_name:
+        return
+    try:
+        rucio_manager.add_container(config.scope, config.container_name)
+        rucio_manager.attach_dataset_to_container(
+            config.scope, config.container_name, config.dataset_name,
+        )
+        log.info(
+            "Dataset %s attached to container %s",
+            config.dataset_did, config.container_did,
+        )
+    except Exception as exc:
+        log.warning("Container attachment failed: %s", exc)
+
+
+def _run_full_pipeline(config, state, rucio_manager, registry=None):
+    # type: (Config, StateFile, RucioManager, Optional[DatasetRegistry]) -> int
     """
     Execute the complete pipeline:
 
@@ -171,17 +303,51 @@ def _run_full_pipeline(config, state, rucio_manager):
     # any resume can safely re-call this (Rucio ignores DataIdentifierAlreadyExists).
     rucio_manager.add_dataset(config.scope, config.dataset_name)
 
-    # Step 2: Generate files (skips already-created files on resume).
-    generated = run_generation(config, state, rucio_manager)
+    # Step 2: Determine how many new files to generate.
+    #
+    # num_files is the *target total* for the dataset — not necessarily the
+    # number to generate this run.  Subtract files already in Rucio (from
+    # previous runs) and files already tracked in the state file (from this
+    # run: generated but not yet registered) to get the remaining shortfall.
+    existing_in_rucio = rucio_manager.count_dataset_files(
+        config.scope, config.dataset_name
+    )
+    current_state_count = state.count()
+    new_files_needed = max(0, config.num_files - existing_in_rucio - current_state_count)
+
+    log.info(
+        "Dataset target: %d file(s) | in Rucio: %d | in state: %d | to generate: %d",
+        config.num_files, existing_in_rucio, current_state_count, new_files_needed,
+    )
+
+    # If the dataset is already at (or above) the target and there is nothing
+    # in the local state file to finish registering, just ensure the rule exists.
+    if new_files_needed == 0 and current_state_count == 0:
+        log.info(
+            "Dataset %s already has %d/%d file(s) — skipping generation",
+            config.dataset_did, existing_in_rucio, config.num_files,
+        )
+        rule_id = rucio_manager.add_replication_rule(
+            scope=config.scope,
+            dataset_name=config.dataset_name,
+            rse=config.rse,
+            lifetime=config.rule_lifetime,
+        )
+        _update_registry(config, registry, rule_id, 0)
+        _attach_to_container(config, rucio_manager)
+        return 0
+
+    # Step 3: Generate files (skips already-created files on resume).
+    generated = run_generation(config, state, rucio_manager, new_count=new_files_needed)
 
     if not generated:
         log.warning("No files were generated — nothing to register")
         return 0
 
-    # Step 3: Register replicas in a single batch call.
+    # Step 4: Register replicas in a single batch call.
     failures = _register_replicas(config, state, rucio_manager, generated)
 
-    # Step 4: Attach all successfully registered file DIDs to the dataset.
+    # Step 5: Attach all successfully registered file DIDs to the dataset.
     registered_entries = state.get_files_by_status(FileStatus.REGISTERED, FileStatus.RULED)
     if registered_entries:
         file_dids = [
@@ -190,7 +356,7 @@ def _run_full_pipeline(config, state, rucio_manager):
         ]
         rucio_manager.attach_dids(config.scope, config.dataset_name, file_dids)
 
-    # Step 5: Create the replication rule on the dataset DID.
+    # Step 6: Create the replication rule on the dataset DID.
     if registered_entries:
         rule_id = rucio_manager.add_replication_rule(
             scope=config.scope,
@@ -203,6 +369,8 @@ def _run_full_pipeline(config, state, rucio_manager):
             if entry.get("status") == FileStatus.REGISTERED:
                 state.update(entry["key"], status=FileStatus.RULED, rule_id=rule_id)
         log.info("Pipeline complete: rule_id=%s", rule_id)
+        _update_registry(config, registry, rule_id, len(registered_entries))
+        _attach_to_container(config, rucio_manager)
 
     return failures
 
@@ -218,8 +386,8 @@ def _run_create_only(config, state, rucio_manager):
     return failures
 
 
-def _run_register_only(config, state, rucio_manager):
-    # type: (Config, StateFile, RucioManager) -> int
+def _run_register_only(config, state, rucio_manager, registry=None):
+    # type: (Config, StateFile, RucioManager, Optional[DatasetRegistry]) -> int
     """Register files already present in the state file; skip generation."""
     rucio_manager.add_dataset(config.scope, config.dataset_name)
 
@@ -243,6 +411,8 @@ def _run_register_only(config, state, rucio_manager):
         )
         for entry in registered_entries:
             state.update(entry["key"], status=FileStatus.RULED, rule_id=rule_id)
+        _update_registry(config, registry, rule_id, len(registered_entries))
+        _attach_to_container(config, rucio_manager)
 
     return failures
 
@@ -337,17 +507,19 @@ def _register_replicas(config, state, rucio_manager, file_entries):
     if not to_register:
         return 0
 
-    replica_batch = []
-    for entry in to_register:
-        rec = {
+    # For deterministic RSEs Rucio derives the PFN from the LFN automatically.
+    # Passing an explicit pfn (e.g. a local POSIX mount path) would cause
+    # "RSE does not support requested protocol" because it would not match
+    # the RSE's registered protocol (e.g. davs://).
+    replica_batch = [
+        {
             "scope": config.scope,
             "name": entry["lfn_name"],
             "bytes": entry["bytes"],
             "adler32": entry["adler32"],
         }
-        if entry.get("pfn"):
-            rec["pfn"] = entry["pfn"]
-        replica_batch.append(rec)
+        for entry in to_register
+    ]
 
     try:
         rucio_manager.add_replicas(config.rse, replica_batch)
@@ -371,6 +543,12 @@ def main():
     parser = _build_parser()
     args = parser.parse_args()
 
+    # Load .env file if present.  Variables already set in the shell are
+    # not overridden (override=False is the default).  Silently ignored
+    # when no .env file exists so CI and container environments work
+    # without one.
+    load_dotenv()
+
     # ------------------------------------------------------------------
     # Bootstrap logging before Config so errors are visible.
     # ------------------------------------------------------------------
@@ -393,6 +571,24 @@ def main():
     # Apply the resolved log level (may differ from pre-bootstrap level).
     logging.getLogger().setLevel(getattr(logging, config.log_level, logging.INFO))
 
+    # ------------------------------------------------------------------
+    # --check-auth: verify credentials and exit without running the pipeline.
+    # We skip config.validate() so that a missing/unmounted rse_mount does
+    # not block an auth check on a machine that lacks the RSE filesystem.
+    # ------------------------------------------------------------------
+    if args.check_auth:
+        rucio_manager = RucioManager(config=config, dry_run=False)
+        try:
+            info = rucio_manager.check_auth()
+            print("Auth OK")
+            print("  account : {}".format(info.get("account", "?")))
+            print("  status  : {}".format(info.get("status", "?")))
+            print("  type    : {}".format(info.get("account_type", info.get("type", "?"))))
+        except Exception as exc:
+            log.error("Auth check failed: %s", exc)
+            sys.exit(2)
+        sys.exit(0)
+
     try:
         config.validate()
     except ConfigError as exc:
@@ -400,6 +596,12 @@ def main():
         sys.exit(2)
 
     log.info("Starting dataset-generator run_id=%s dry_run=%s", config.run_id, config.dry_run)
+    log.info("Dataset DID : %s", config.dataset_did)
+    log.info("Dataset name: %s  (%s)",
+             config.dataset_name,
+             "static" if config._dataset_name_override else "dynamic")
+    if config.container_name:
+        log.info("Container   : %s", config.container_did)
     log.debug("Config: %r", config)
 
     # ------------------------------------------------------------------
@@ -415,11 +617,54 @@ def main():
     if state.run_id != config.run_id:
         log.info("Resuming run_id=%s from state file", state.run_id)
         config.run_id = state.run_id
+        # Invalidate the file_prefix cache so it is re-rendered with the
+        # correct run_id before worker threads access it.
+        config.invalidate_name_cache()
+
+    # Pre-warm the file_prefix cache now (single-threaded context) so all
+    # Pool A worker threads see a consistent, already-rendered value.
+    _ = config.file_prefix
 
     # ------------------------------------------------------------------
-    # Initialise Rucio manager.
+    # Create a unique per-run staging directory and register cleanup.
+    #
+    # tempfile.mkdtemp() returns an exclusive, randomly-named directory so
+    # parallel invocations never share staging space even on the same host.
+    # atexit ensures the directory (and any leftover temp files from an
+    # interrupted run) is removed when the process exits normally.
+    # ------------------------------------------------------------------
+    base_staging = config.staging_dir or tempfile.gettempdir()
+    try:
+        os.makedirs(base_staging, exist_ok=True)
+        run_staging = tempfile.mkdtemp(
+            prefix="rucio-gen-{}-".format(config.run_id),
+            dir=base_staging,
+        )
+    except OSError as exc:
+        log.error("Cannot create staging directory under %r: %s", base_staging, exc)
+        sys.exit(2)
+
+    atexit.register(shutil.rmtree, run_staging, True)   # True = ignore_errors
+    config.staging_dir = run_staging
+    log.debug("Staging directory: %s", run_staging)
+
+    # ------------------------------------------------------------------
+    # Initialise Rucio manager and assert RSE is deterministic.
     # ------------------------------------------------------------------
     rucio_manager = RucioManager(config=config, dry_run=config.dry_run)
+
+    try:
+        rucio_manager.assert_rse_deterministic(config.rse)
+    except Exception as exc:
+        log.error("RSE check failed: %s", exc)
+        sys.exit(2)
+
+    # ------------------------------------------------------------------
+    # Open registry (disabled when registry_file is empty/null).
+    # ------------------------------------------------------------------
+    registry = _open_registry(config)
+    if registry is not None:
+        log.debug("Registry file: %s", config.registry_file or DEFAULT_REGISTRY_FILE)
 
     # ------------------------------------------------------------------
     # Dispatch to the requested mode.
@@ -430,9 +675,9 @@ def main():
         elif config.create_only:
             failures = _run_create_only(config, state, rucio_manager)
         elif config.register_only:
-            failures = _run_register_only(config, state, rucio_manager)
+            failures = _run_register_only(config, state, rucio_manager, registry=registry)
         else:
-            failures = _run_full_pipeline(config, state, rucio_manager)
+            failures = _run_full_pipeline(config, state, rucio_manager, registry=registry)
     except KeyboardInterrupt:
         log.warning("Interrupted — state saved to %s", config.state_file_path)
         sys.exit(1)
