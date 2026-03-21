@@ -373,11 +373,17 @@ def _run_full_pipeline(config, state, rucio_manager, registry=None):
     failures = _register_replicas(config, state, rucio_manager, generated)
 
     # Step 5: Attach all successfully registered file DIDs to the dataset.
+    # Fetch both REGISTERED and RULED so the rule-creation step below can
+    # mark the REGISTERED ones as RULED.  Only REGISTERED files are passed to
+    # attach_dids — RULED files are already attached; including them would cause
+    # Rucio to raise DuplicateContent on any resumed run.
     registered_entries = state.get_files_by_status(FileStatus.REGISTERED, FileStatus.RULED)
-    if registered_entries:
+    newly_registered = [e for e in registered_entries
+                        if e.get("status") == FileStatus.REGISTERED]
+    if newly_registered:
         file_dids = [
             {"scope": config.scope, "name": e["lfn_name"]}
-            for e in registered_entries
+            for e in newly_registered
         ]
         rucio_manager.attach_dids(config.scope, config.dataset_name, file_dids)
 
@@ -392,15 +398,17 @@ def _run_full_pipeline(config, state, rucio_manager, registry=None):
             )
         except Exception as exc:
             log.error("add_replication_rule failed: %s", exc)
+            # Count the rule failure once, then mark all REGISTERED files as
+            # FAILED_RULE so they can be retried.  RULED files are left as-is
+            # (they already have a rule from a prior run).
+            failures += 1
             for entry in registered_entries:
                 if entry.get("status") == FileStatus.REGISTERED:
                     state.update(entry["key"], status=FileStatus.FAILED_RULE)
-                    failures += 1
             return failures
-        # Mark all registered files as ruled.
-        for entry in registered_entries:
-            if entry.get("status") == FileStatus.REGISTERED:
-                state.update(entry["key"], status=FileStatus.RULED, rule_id=rule_id)
+        # Mark all newly-registered files as ruled.
+        for entry in newly_registered:
+            state.update(entry["key"], status=FileStatus.RULED, rule_id=rule_id)
         log.info("Pipeline complete: rule_id=%s", rule_id)
         _update_registry(config, registry, rule_id, len(registered_entries))
         _attach_to_container(config, rucio_manager)
@@ -537,11 +545,12 @@ def _register_replicas(config, state, rucio_manager, file_entries):
     int
         Number of entries that could not be registered.
     """
-    # Exclude entries already beyond CREATED (e.g. resumed REGISTERED/RULED)
+    # Exclude entries already beyond CREATED (e.g. resumed REGISTERED/RULED).
+    # e.get("status") returns None for entries without a status key, and None
+    # is in the tuple, so the condition handles both cases correctly.
     to_register = [
         e for e in file_entries
         if e.get("status") in (FileStatus.CREATED, FileStatus.FAILED_REGISTRATION, None)
-        or "status" not in e  # freshly generated (status not in dict yet)
     ]
     if not to_register:
         return 0

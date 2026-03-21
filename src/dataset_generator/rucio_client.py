@@ -220,11 +220,13 @@ class RucioManager(object):
             except Exception as exc:
                 # Detect retryable exception types by class name so we don't
                 # need a hard import of rucio.common.exception at module load.
+                # Only requests errors and RucioException subclasses are retried;
+                # all other exceptions (including Python built-ins) propagate
+                # immediately without consuming retry attempts.
                 exc_type = type(exc).__name__
                 is_retryable = (
                     isinstance(exc, requests.RequestException)
                     or "RucioException" in exc_type
-                    or exc_type.endswith("Exception")
                 )
                 if not is_retryable or attempt == MAX_RETRIES - 1:
                     raise
