@@ -24,8 +24,7 @@ csprng (default)
     Streaming pseudo-random data via the fastest available stdlib generator
     (``random.randbytes`` on Python 3.9+, ``os.urandom`` on 3.6–3.8).
     Each chunk is independently generated and written through a raw OS file
-    descriptor.  ``posix_fallocate`` pre-allocates the file extent where
-    supported.
+    descriptor.
 
 buffer-reuse
     Pre-fills a fixed-size ring buffer with random data once at construction.
@@ -55,6 +54,11 @@ log = logging.getLogger(__name__)
 # (4 threads × 128 MiB = 512 MiB, 8 threads × 128 MiB = 1 GiB).
 CHUNK_SIZE = 128 * 1024 * 1024  # 128 MiB
 
+# Emit a write-progress INFO log line every this many bytes written.
+# At 10 GiB the interval is infrequent enough to avoid log noise for typical
+# file sizes (1–10 GiB) while still confirming progress on very large files.
+_PROGRESS_INTERVAL = 10 * 1024 * 1024 * 1024  # 10 GiB
+
 # Fastest available bulk-random-bytes generator.
 #
 # Python 3.9+  random.randbytes — MT19937 PRNG running entirely in userspace;
@@ -71,11 +75,6 @@ if sys.version_info >= (3, 9):
 else:
     _randbytes = os.urandom
     _RAND_METHOD = "os.urandom (CSPRNG, Python {}.{})".format(*sys.version_info[:2])
-
-# posix_fallocate pre-allocates the full file extent on disk before any data
-# is written, eliminating extent-allocation overhead during sequential writes.
-# Available on Linux/macOS; absent on Windows and some exotic filesystems.
-_HAS_FALLOCATE = hasattr(os, "posix_fallocate")
 
 
 def _fmt_size(n):
@@ -165,49 +164,23 @@ class CsprngFileWriter(FileWriter):
 
     Uses the fastest available stdlib PRNG (``random.randbytes`` on Python
     3.9+, ``os.urandom`` on 3.6–3.8).  Writes via a raw OS file descriptor
-    to avoid the ``BufferedWriter`` memcpy overhead.  ``os.posix_fallocate``
-    pre-allocates the file extent where supported.
+    to avoid the ``BufferedWriter`` memcpy overhead.
 
-    Thread-safe: all instance state is immutable after construction.
-
-    Parameters
-    ----------
-    use_fallocate:
-        Enable ``posix_fallocate`` pre-allocation.  Set to ``False`` on
-        CephFS, where fallocate may write zeros instead of reserving space
-        (making it as slow as a regular write with no benefit).  The flag
-        is silently forced to ``False`` on platforms without the syscall.
+    Thread-safe: no mutable instance state after construction.
     """
-
-    def __init__(self, use_fallocate=True):
-        # type: (bool) -> None
-        # True only if the OS supports fallocate AND the caller has enabled it.
-        self._use_fallocate = use_fallocate and _HAS_FALLOCATE
-
-    @classmethod
-    def from_config(cls, config):
-        # type: (Any) -> CsprngFileWriter
-        use_fallocate = getattr(config, "fallocate", True) if config is not None else True
-        return cls(use_fallocate=use_fallocate)
 
     @property
     def description(self):
         # type: () -> str
-        return "csprng | {} | chunk: {} MiB | fallocate: {}".format(
+        return "csprng | {} | chunk: {} MiB".format(
             _RAND_METHOD,
             CHUNK_SIZE // (1024 * 1024),
-            "yes" if self._use_fallocate else "no",
         )
 
     def write_file(self, path, size_bytes):
         # type: (str, int) -> tuple
         tname = threading.current_thread().name
         log.debug("[%s] csprng write_file: path=%s size=%d", tname, path, size_bytes)
-
-        # Log at INFO for large files (≥ 1 GiB); emit progress every 10%.
-        _GIB = 1024 * 1024 * 1024
-        progress_interval = size_bytes // 10 if size_bytes >= _GIB else 0
-        next_progress = progress_interval
 
         log.info("[%s] Writing %s (%d bytes) csprng → %s",
                  tname, _fmt_size(size_bytes), size_bytes, path)
@@ -216,19 +189,10 @@ class CsprngFileWriter(FileWriter):
         bytes_written = 0
         remaining = size_bytes
         chunk_num = 0
+        next_progress = _PROGRESS_INTERVAL
 
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o666)
         try:
-            # Pre-allocate full extent; silently ignored if unsupported.
-            # NOTE: posix_fallocate extends the file to size_bytes immediately,
-            # so 'ls -la' will show the final file size before data is written.
-            if self._use_fallocate:
-                try:
-                    os.posix_fallocate(fd, 0, size_bytes)
-                    log.debug("[%s] fallocate: ok (%d bytes)", tname, size_bytes)
-                except OSError as exc:
-                    log.debug("[%s] fallocate: skipped (%s)", tname, exc)
-
             while remaining > 0:
                 chunk_num += 1
                 chunk = min(CHUNK_SIZE, remaining)
@@ -244,11 +208,10 @@ class CsprngFileWriter(FileWriter):
                 remaining -= chunk
                 log.debug("[%s] chunk %d: wrote %d bytes, checksum=%08x, remaining=%d",
                           tname, chunk_num, chunk, checksum, remaining)
-                if progress_interval and bytes_written >= next_progress:
-                    pct = 100 * bytes_written // size_bytes
-                    log.info("[%s] Write progress: %d%% (%s / %s)",
-                             tname, pct, _fmt_size(bytes_written), _fmt_size(size_bytes))
-                    next_progress += progress_interval
+                if bytes_written >= next_progress:
+                    log.info("[%s] Write progress: %s / %s",
+                             tname, _fmt_size(bytes_written), _fmt_size(size_bytes))
+                    next_progress += _PROGRESS_INTERVAL
         finally:
             os.close(fd)
             log.debug("[%s] fd closed: %s", tname, path)
@@ -319,14 +282,10 @@ class BufferReuseFileWriter(FileWriter):
     ring_size:
         Size of the random ring in bytes.  Must be >= ``CHUNK_SIZE``
         (128 MiB).  Larger values provide greater data variety across chunks.
-    use_fallocate:
-        Enable ``posix_fallocate`` pre-allocation.  Set to ``False`` on
-        CephFS, where fallocate may write zeros instead of reserving space.
-        Silently forced to ``False`` on platforms without the syscall.
     """
 
-    def __init__(self, ring_size=_DEFAULT_RING_SIZE, use_fallocate=True):
-        # type: (int, bool) -> None
+    def __init__(self, ring_size=_DEFAULT_RING_SIZE):
+        # type: (int) -> None
         if ring_size < _MIN_RING_SIZE:
             raise ValueError(
                 "buffer_reuse_ring_size ({} bytes) must be >= CHUNK_SIZE "
@@ -335,7 +294,6 @@ class BufferReuseFileWriter(FileWriter):
                 )
             )
         self._ring_size = ring_size
-        self._use_fallocate = use_fallocate and _HAS_FALLOCATE
 
         # Fill ring with random data, then extend by CHUNK_SIZE bytes
         # (duplicate the ring's start) so every chunk access is contiguous.
@@ -360,17 +318,15 @@ class BufferReuseFileWriter(FileWriter):
             if config is not None
             else _DEFAULT_RING_SIZE
         )
-        use_fallocate = getattr(config, "fallocate", True) if config is not None else True
-        return cls(ring_size=ring_size, use_fallocate=use_fallocate)
+        return cls(ring_size=ring_size)
 
     @property
     def description(self):
         # type: () -> str
         return (
-            "buffer-reuse | ring: {} MiB | chunk: {} MiB | fallocate: {}".format(
+            "buffer-reuse | ring: {} MiB | chunk: {} MiB".format(
                 self._ring_size // (1024 * 1024),
                 CHUNK_SIZE // (1024 * 1024),
-                "yes" if self._use_fallocate else "no",
             )
         )
 
@@ -380,11 +336,6 @@ class BufferReuseFileWriter(FileWriter):
         log.debug("[%s] buffer-reuse write_file: path=%s size=%d ring=%d",
                   tname, path, size_bytes, self._ring_size)
 
-        # Log at INFO for large files (≥ 1 GiB); emit progress every 10%.
-        _GIB = 1024 * 1024 * 1024
-        progress_interval = size_bytes // 10 if size_bytes >= _GIB else 0
-        next_progress = progress_interval
-
         log.info("[%s] Writing %s (%d bytes) buffer-reuse → %s",
                  tname, _fmt_size(size_bytes), size_bytes, path)
 
@@ -393,16 +344,10 @@ class BufferReuseFileWriter(FileWriter):
         remaining = size_bytes
         extended = self._extended  # local ref avoids repeated attr lookup
         chunk_num = 0
+        next_progress = _PROGRESS_INTERVAL
 
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o666)
         try:
-            if self._use_fallocate:
-                try:
-                    os.posix_fallocate(fd, 0, size_bytes)
-                    log.debug("[%s] fallocate: ok (%d bytes)", tname, size_bytes)
-                except OSError as exc:
-                    log.debug("[%s] fallocate: skipped (%s)", tname, exc)
-
             while remaining > 0:
                 chunk_num += 1
                 chunk = min(CHUNK_SIZE, remaining)
@@ -423,11 +368,10 @@ class BufferReuseFileWriter(FileWriter):
                 remaining -= chunk
                 log.debug("[%s] chunk %d: wrote %d bytes, checksum=%08x, remaining=%d",
                           tname, chunk_num, chunk, checksum, remaining)
-                if progress_interval and bytes_written >= next_progress:
-                    pct = 100 * bytes_written // size_bytes
-                    log.info("[%s] Write progress: %d%% (%s / %s)",
-                             tname, pct, _fmt_size(bytes_written), _fmt_size(size_bytes))
-                    next_progress += progress_interval
+                if bytes_written >= next_progress:
+                    log.info("[%s] Write progress: %s / %s",
+                             tname, _fmt_size(bytes_written), _fmt_size(size_bytes))
+                    next_progress += _PROGRESS_INTERVAL
         finally:
             os.close(fd)
             log.debug("[%s] fd closed: %s", tname, path)
