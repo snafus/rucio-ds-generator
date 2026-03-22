@@ -206,8 +206,9 @@ class CsprngFileWriter(FileWriter):
                 checksum = zlib.adler32(data, checksum) & 0xFFFFFFFF
                 bytes_written += chunk
                 remaining -= chunk
-                log.debug("[%s] chunk %d: wrote %d bytes, checksum=%08x, remaining=%d",
-                          tname, chunk_num, chunk, checksum, remaining)
+                if chunk_num % 500 == 0:
+                    log.debug("[%s] chunk %d: wrote %d bytes, checksum=%08x, remaining=%d",
+                              tname, chunk_num, chunk, checksum, remaining)
                 if bytes_written >= next_progress:
                     log.info("[%s] Write progress: %s / %s",
                              tname, _fmt_size(bytes_written), _fmt_size(size_bytes))
@@ -355,8 +356,6 @@ class BufferReuseFileWriter(FileWriter):
                 # slice [start, start+chunk) is always contiguous.
                 start = random.randrange(self._ring_size)
                 data = extended[start:start + chunk]
-                log.debug("[%s] chunk %d: ring offset=%d len=%d",
-                          tname, chunk_num, start, chunk)
 
                 written = 0
                 while written < chunk:
@@ -366,8 +365,9 @@ class BufferReuseFileWriter(FileWriter):
                 checksum = zlib.adler32(data, checksum) & 0xFFFFFFFF
                 bytes_written += chunk
                 remaining -= chunk
-                log.debug("[%s] chunk %d: wrote %d bytes, checksum=%08x, remaining=%d",
-                          tname, chunk_num, chunk, checksum, remaining)
+                if chunk_num % 500 == 0:
+                    log.debug("[%s] chunk %d: ring offset=%d, wrote %d bytes, checksum=%08x, remaining=%d",
+                              tname, chunk_num, start, chunk, checksum, remaining)
                 if bytes_written >= next_progress:
                     log.info("[%s] Write progress: %s / %s",
                              tname, _fmt_size(bytes_written), _fmt_size(size_bytes))
