@@ -53,3 +53,32 @@ jobs:
 
       - name: Run tests
         run: python3 -m pytest tests/ -v --tb=short
+
+  test-matrix:
+    name: Test suite (ubuntu / Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.13"]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Upgrade pip
+        run: pip install --upgrade pip setuptools wheel
+
+      - name: Install package and test dependencies
+        # Install runtime deps via the package, then install a current pytest
+        # separately — pyproject.toml pins pytest<7 for Python 3.6 compat but
+        # that constraint is not needed here.
+        run: pip install -e . && pip install pytest
+
+      - name: Run tests
+        run: pytest tests/ -v --tb=short
