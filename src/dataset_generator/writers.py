@@ -339,8 +339,17 @@ class BufferReuseFileWriter(FileWriter):
 
         # Fill ring with random data, then extend by CHUNK_SIZE bytes
         # (duplicate the ring's start) so every chunk access is contiguous.
-        extended = bytearray(_randbytes(ring_size))
-        extended += extended[:CHUNK_SIZE]
+        #
+        # Build in CHUNK_SIZE pieces: Python 3.9's random.randbytes(n)
+        # calls getrandbits(n * 8) internally, which overflows a C int when
+        # n > ~268 MiB (n * 8 > 2^31 - 1).  Fixed in Python 3.11+.
+        extended = bytearray(ring_size + CHUNK_SIZE)
+        pos = 0
+        while pos < ring_size:
+            step = min(CHUNK_SIZE, ring_size - pos)
+            extended[pos:pos + step] = _randbytes(step)
+            pos += step
+        extended[ring_size:] = extended[:CHUNK_SIZE]  # contiguous wraparound copy
         self._extended = memoryview(extended)
 
     @classmethod
