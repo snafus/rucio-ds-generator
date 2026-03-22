@@ -157,6 +157,7 @@ class Config(object):
         "registry_file": None,   # None → DEFAULT_REGISTRY_FILE; "" → disabled
         "generation_mode": "csprng",        # FileWriter back-end; see writers.py
         "buffer_reuse_ring_size": "512MiB", # ring buffer size for buffer-reuse mode
+        "xattr": True,                      # write XrdCks adler32 xattr after placement
     }
 
     def __init__(
@@ -192,6 +193,7 @@ class Config(object):
         registry_file=None,     # type: Optional[str]  registry path; None = default; "" = disabled
         generation_mode="csprng",          # type: str  FileWriter back-end key; see writers.py
         buffer_reuse_ring_size="512MiB",   # type: object  Ring size for buffer-reuse mode
+        xattr=True,                        # type: bool  Write XrdCks adler32 xattr after placement
     ):
         self.scope = scope
         self.rse = rse
@@ -229,6 +231,7 @@ class Config(object):
         self.buffer_reuse_ring_size = _parse_size(
             buffer_reuse_ring_size if buffer_reuse_ring_size is not None else "512MiB"
         )
+        self.xattr = bool(xattr) if xattr is not None else True
 
     # ------------------------------------------------------------------
     # Computed properties
@@ -466,6 +469,7 @@ class Config(object):
             registry_file=get("registry_file"),
             generation_mode=get("generation_mode"),
             buffer_reuse_ring_size=get("buffer_reuse_ring_size"),
+            xattr=get("xattr"),
         )
 
     # ------------------------------------------------------------------
