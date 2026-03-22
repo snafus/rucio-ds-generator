@@ -152,7 +152,7 @@ class DatasetRegistry(object):
         parent = os.path.dirname(self._path)
         if parent:
             os.makedirs(parent, exist_ok=True)
-        tmp_path = "{}.tmp".format(self._path)
+        tmp_path = "{}.{}.tmp".format(self._path, os.getpid())
         try:
             with open(tmp_path, "w") as fh:
                 json.dump(self._data, fh, indent=2)

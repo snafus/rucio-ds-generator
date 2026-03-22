@@ -103,7 +103,8 @@ class TestFullPipelineRuleFailure:
         with patch("dataset_generator.__main__.run_generation", return_value=entries):
             failures = _run_full_pipeline(config, state, mock_rucio)
 
-        assert failures == 2
+        # Rule creation counts as one failure regardless of how many files are affected.
+        assert failures == 1
         assert state.get_file("file_000000")["status"] == FileStatus.FAILED_RULE
         assert state.get_file("file_000001")["status"] == FileStatus.FAILED_RULE
 

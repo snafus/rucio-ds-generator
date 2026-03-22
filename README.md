@@ -225,7 +225,7 @@ container_name: "{{ scope }}_{{ rse }}_tests"
 Optional settings (shown with their defaults):
 
 ```yaml
-threads: 4                # File-generation threads (Pool A). Default: 4
+threads: 4                # File-generation worker processes (Pool A). Default: 4
 log_level: INFO           # DEBUG | INFO | WARNING | ERROR
 rule_lifetime: ~          # Rule lifetime in seconds; null = permanent
                           # e.g. 604800 = 7 days, 2592000 = 30 days
@@ -268,8 +268,16 @@ rule_lifetime: ~          # Rule lifetime in seconds; null = permanent
 # Ring buffer size for buffer-reuse mode.
 # Accepts a raw integer (bytes) or human-readable string (same units as file_size_bytes).
 # Must be >= 128 MiB (the write chunk size). Peak RSS during construction ≈ 2 × ring size.
+# Memory footprint per worker process ≈ ring_size + 128 MiB; at 4 workers + 512 MiB ≈ 2.5 GiB total.
 # Default: 512MiB. Larger values provide greater data variety across files.
 # buffer_reuse_ring_size: 512MiB
+
+# Disable fallocate() pre-allocation when placing files on the RSE.
+# fallocate is enabled by default and tells the OS to reserve disk space before writing,
+# reducing fragmentation and avoiding mid-write ENOSPC on most filesystems.
+# Disable on CephFS (and similar distributed filesystems) where fallocate() fills the
+# allocated space with zeroes instead of merely reserving it, causing unnecessary I/O.
+# fallocate: true
 ```
 
 Any YAML value can be overridden on the command line — see
@@ -314,13 +322,16 @@ The tool:
 4. Counts files already in the dataset (`list_files`) and computes how many
    new files to generate: `max(0, num_files − existing_in_rucio − state_count)`.
    If the dataset already has enough files, generation is skipped entirely.
-5. Generates files in parallel (Pool A, `--threads` workers):
-   - Writes each file to a unique per-run staging directory in 64 MiB chunks.
+5. Generates files in parallel (Pool A, `--threads` worker processes):
+   - Writes each file to a unique per-run staging directory in 128 MiB chunks.
    - Accumulates an adler32 checksum over every chunk.
    - Resolves the final physical path via `lfns2pfns`.
-   - Moves the file to `{final_pfn}.part` on the RSE filesystem, sets
-     ownership (`rse_uid`/`rse_gid` if configured), then atomically renames
-     to the final path.
+   - Copies the file to `{final_pfn}.part.{pid}.{tid}` on the RSE filesystem
+     using `os.sendfile` (kernel zero-copy) where available, or an 8 MiB
+     read/write loop otherwise.  Sets ownership (`rse_uid`/`rse_gid` if
+     configured), then atomically renames to the final path.
+   - Placements run concurrently with the next write via a dedicated
+     `ThreadPoolExecutor` (Pool B), so disk I/O and RSE copy overlap.
 6. Registers all replicas in a single batch call (`add_replicas`).
 7. Attaches all file DIDs to the dataset (`attach_dids`).
 8. Creates one replication rule on the dataset DID (`add_replication_rule`).
@@ -534,7 +545,7 @@ pip install pytest-cov
 pytest --cov=dataset_generator --cov-report=term-missing
 ```
 
-The suite currently contains **252 tests** across six files:
+The suite currently contains **274 tests** across seven files:
 
 | File | What it covers |
 |------|---------------|
@@ -544,6 +555,7 @@ The suite currently contains **252 tests** across six files:
 | `tests/test_rucio_client.py` | OIDC token lifecycle, retry logic, all Rucio API calls, container ops |
 | `tests/test_registry.py` | Registry upsert, persistence, thread safety, atomic write |
 | `tests/test_writers.py` | FileWriter ABC, CsprngFileWriter, BufferReuseFileWriter, factory |
+| `tests/test_main.py` | Pipeline error paths: rule-creation failure, status transitions |
 
 All tests run in under ten seconds. No network access or RSE mount is required.
 
@@ -554,14 +566,14 @@ All tests run in under ten seconds. No network access or RSE mount is required.
 ```
 usage: dataset-generator [--config PATH] [--dry-run] [--threads N]
                          [--log-level LEVEL] [--state-file PATH] [--run-id ID]
-                         [--check-auth]
+                         [--check-auth] [--no-fallocate]
                          [--create-only | --register-only | --cleanup]
                          [config overrides ...]
 
 General:
   --config PATH          YAML configuration file
   --dry-run              Log all actions without executing them
-  --threads N            File-generation thread count (Pool A). Default: 4
+  --threads N            File-generation worker process count (Pool A). Default: 4
   --log-level LEVEL      DEBUG | INFO | WARNING | ERROR. Default: INFO
   --state-file PATH      Override state file path. Default: ./state_{run_id}.json
   --run-id ID            Override run identifier (12-char hex); used for resume
@@ -597,6 +609,10 @@ Config overrides (all settable in YAML; CLI wins):
   --buffer-reuse-ring-size SIZE
                          Ring buffer size for buffer-reuse mode (default: 512MiB).
                          Same unit syntax as --file-size-bytes. Must be >= 128 MiB.
+                         Memory footprint per worker process ≈ ring_size + 128 MiB.
+  --no-fallocate         Disable fallocate() pre-allocation when placing files on the RSE.
+                         Recommended on CephFS where fallocate() writes zeros instead of
+                         reserving space. Enabled by default on supporting filesystems.
   --registry-file PATH   Global registry JSON path (default: ~/.rucio-ds-generator/registry.json;
                          set to "" to disable)
   --rucio-host           Rucio server URL

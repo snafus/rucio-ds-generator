@@ -1,6 +1,6 @@
 """
 Tests for generator.py — file generation, adler32 correctness, atomic placement,
-Pool A threading, and resume behaviour.
+Pool A multiprocessing, and resume behaviour.
 
 All tests use temporary directories so no files are written outside /tmp.
 The RucioManager is mocked: lfns2pfn returns a deterministic path based on
@@ -14,13 +14,14 @@ from unittest.mock import MagicMock, patch, call
 
 import pytest
 
+import dataset_generator.generator as _gen_module
 from dataset_generator.config import Config
 from dataset_generator.generator import (
-    _generate_one,
     _makedirs_chown,
     _pfn_to_local,
     _place_file,
     _state_key,
+    _write_one_worker,
     run_generation,
 )
 from dataset_generator.state import FileStatus, StateFile
@@ -308,7 +309,7 @@ class TestPlaceFile:
             assert fh.read() == b"crossfs"
 
     def test_part_file_cleaned_up_on_crossfs_copy_failure(self, tmp_path):
-        """If shutil.copy2 fails on a cross-filesystem move, the partial .part must be removed."""
+        """If the cross-filesystem copy fails, the partial .part must be removed."""
         tmp_file = str(tmp_path / "src.tmp")
         with open(tmp_file, "wb") as fh:
             fh.write(b"data")
@@ -325,7 +326,8 @@ class TestPlaceFile:
             return real_rename(src, dst)
 
         with patch("os.rename", side_effect=patched_rename):
-            with patch("shutil.copy2", side_effect=OSError("disk full")):
+            with patch("dataset_generator.generator._copy_file_fast",
+                       side_effect=OSError("disk full")):
                 with pytest.raises(OSError, match="disk full"):
                     _place_file(tmp_file, final)
 
@@ -420,71 +422,97 @@ class TestPfnToLocal:
 
 
 # ---------------------------------------------------------------------------
-# _generate_one
+# _write_one_worker — worker task unit tests
+#
+# _write_one_worker reads from module-level globals (_proc_config,
+# _proc_writer).  Tests set these directly and reset them in teardown so
+# they do not leak between tests.
 # ---------------------------------------------------------------------------
 
-class TestGenerateOne:
-    def _make_progress(self):
-        import threading
-        lock = threading.Lock()
-        pbar = MagicMock()
-        return lock, pbar
+class TestWriteOneWorker:
+    """Tests for the Pool A worker task function."""
 
-    def test_generates_file_and_updates_state(self, config, state, mock_rucio, writer):
-        state.allocate(_state_key(0))
-        lock, pbar = self._make_progress()
-        result = _generate_one(0, config, state, mock_rucio, writer, lock, pbar)
+    @pytest.fixture(autouse=True)
+    def reset_globals(self):
+        """Restore module globals to None after every test."""
+        yield
+        _gen_module._proc_config = None
+        _gen_module._proc_writer = None
 
-        assert result["key"] == "file_000000"
-        assert len(result["adler32"]) == 8
-        assert result["bytes"] == config.file_size_bytes
-        assert result["lfn"].startswith("test:")
-        assert os.path.exists(result["pfn"])
+    def _setup(self, config, writer):
+        _gen_module._proc_config = config
+        _gen_module._proc_writer = writer
 
-        entry = state.get_file("file_000000")
-        assert entry["status"] == FileStatus.CREATED
+    def test_success_returns_tuple(self, config, writer, tmp_path):
+        self._setup(config, writer)
+        result = _write_one_worker(0)
+        idx, staging_path, checksum_hex, bytes_written, error_str = result
+        assert idx == 0
+        assert error_str is None
+        assert os.path.exists(staging_path)   # staged file present for main process
+        assert bytes_written == config.file_size_bytes
+        assert len(checksum_hex) == 8
+        assert checksum_hex == checksum_hex.lower()
 
-    def test_lfn_name_includes_checksum(self, config, state, mock_rucio, writer):
-        state.allocate(_state_key(0))
-        lock, pbar = self._make_progress()
-        result = _generate_one(0, config, state, mock_rucio, writer, lock, pbar)
-        # LFN name format: {prefix}_{8-char-hex}
-        parts = result["lfn_name"].rsplit("_", 1)
-        assert parts[0] == config.file_prefix
-        assert len(parts[1]) == 8
-        assert parts[1] == result["adler32"]
+    def test_lfn_name_checksum_is_8_char_hex(self, config, writer):
+        self._setup(config, writer)
+        _, _, checksum_hex, _, error_str = _write_one_worker(0)
+        assert error_str is None
+        assert len(checksum_hex) == 8
+        assert all(c in "0123456789abcdef" for c in checksum_hex)
 
-    def test_no_temp_file_left_after_success(self, config, state, mock_rucio, writer, rse_mount):
-        state.allocate(_state_key(0))
-        lock, pbar = self._make_progress()
-        _generate_one(0, config, state, mock_rucio, writer, lock, pbar)
-        tmp_dir = os.path.join(rse_mount, ".gen_tmp")
-        if os.path.exists(tmp_dir):
-            assert not any(f.endswith(".tmp") for f in os.listdir(tmp_dir) if ".tmp." in f)
+    def test_staging_file_present_after_success(self, config, writer):
+        """Worker leaves the staging file for the main process to pick up."""
+        self._setup(config, writer)
+        _, staging_path, _, _, error_str = _write_one_worker(0)
+        assert error_str is None
+        assert staging_path is not None
+        assert os.path.isfile(staging_path)
 
-    def test_failure_marks_state_failed_creation(self, config, state, writer, rse_mount):
-        state.allocate(_state_key(0))
-        bad_rucio = MagicMock()
-        bad_rucio.lfns2pfn.side_effect = RuntimeError("network down")
-        lock, pbar = self._make_progress()
+    def test_failure_returns_error_string(self, config, writer):
+        self._setup(config, writer)
+        with patch.object(writer, "write_file", side_effect=OSError("disk error")):
+            result = _write_one_worker(0)
+        idx, staging_path, checksum_hex, bytes_written, error_str = result
+        assert idx == 0
+        assert staging_path is None
+        assert checksum_hex is None
+        assert bytes_written is None
+        assert "disk error" in error_str
 
-        with pytest.raises(RuntimeError, match="network down"):
-            _generate_one(0, config, state, bad_rucio, writer, lock, pbar)
+    def test_failure_cleans_up_staging_file(self, config, writer):
+        """After a write failure the partial staging file must not remain."""
+        self._setup(config, writer)
+        staging_dir = config.staging_dir
 
-        entry = state.get_file("file_000000")
-        assert entry["status"] == FileStatus.FAILED_CREATION
+        # Patch write_file to create a partial file then raise.
+        def bad_write(path, size):
+            with open(path, "wb") as fh:
+                fh.write(b"partial")
+            raise OSError("disk full")
 
-    def test_dry_run_does_not_write_files(self, config, state, mock_rucio, writer, rse_mount):
+        with patch.object(writer, "write_file", side_effect=bad_write):
+            _write_one_worker(0)
+
+        remaining = [f for f in os.listdir(staging_dir) if f.endswith(".tmp.000000")]
+        assert remaining == [], "orphaned staging file: {}".format(remaining)
+
+    def test_dry_run_skips_write(self, config, writer):
         config.dry_run = True
-        state.allocate(_state_key(0))
-        lock, pbar = self._make_progress()
-        result = _generate_one(0, config, state, mock_rucio, writer, lock, pbar)
+        self._setup(config, writer)
+        with patch.object(writer, "write_file") as mock_write:
+            result = _write_one_worker(0)
+        mock_write.assert_not_called()
+        _, _, checksum_hex, bytes_written, error_str = result
+        assert error_str is None
+        assert checksum_hex == format(0xDEADBEEF & 0xFFFFFFFF, "08x")
+        assert bytes_written == config.file_size_bytes
 
-        # No physical file should exist
-        assert not os.path.exists(result["pfn"])
-        # But state must still be updated
-        entry = state.get_file("file_000000")
-        assert entry["status"] == FileStatus.CREATED
+    def test_different_indices_produce_different_paths(self, config, writer):
+        self._setup(config, writer)
+        r0 = _write_one_worker(0)
+        r1 = _write_one_worker(1)
+        assert r0[1] != r1[1]   # staging paths differ
 
 
 # ---------------------------------------------------------------------------
@@ -548,6 +576,20 @@ class TestRunGeneration:
         results = run_generation(config, state, mock_rucio)
         assert len(results) == config.num_files
 
+    def test_dry_run_does_not_write_files(self, config, state, mock_rucio, rse_mount):
+        """In dry-run mode no physical files should appear on the RSE mount."""
+        config.dry_run = True
+        results = run_generation(config, state, mock_rucio)
+        for r in results:
+            assert not os.path.exists(r["pfn"])
+
+    def test_dry_run_state_updated_to_created(self, config, state, mock_rucio):
+        """dry-run must still advance state to CREATED."""
+        config.dry_run = True
+        run_generation(config, state, mock_rucio)
+        created = state.get_files_by_status(FileStatus.CREATED)
+        assert len(created) == config.num_files
+
     def test_new_count_additive(self, config, state, mock_rucio, rse_mount):
         """new_count generates that many files on top of the existing state."""
         # Simulate 2 files already CREATED in a previous run
@@ -570,3 +612,19 @@ class TestRunGeneration:
         results = run_generation(config, state, mock_rucio, new_count=0)
         assert len(results) == config.num_files
         assert mock_rucio.lfns2pfn.call_count == call_count_before  # no new calls
+
+    def test_lfns2pfn_failure_marks_failed_creation(self, config, state, mock_rucio):
+        """If lfns2pfn raises in the main process, the file is marked FAILED_CREATION."""
+        mock_rucio.lfns2pfn.side_effect = RuntimeError("rucio down")
+        results = run_generation(config, state, mock_rucio)
+        assert results == []
+        failed = state.get_files_by_status(FileStatus.FAILED_CREATION)
+        assert len(failed) == config.num_files
+
+    def test_lfns2pfn_failure_cleans_up_staging(self, config, state, mock_rucio):
+        """Staging files must be removed when post-write processing fails."""
+        mock_rucio.lfns2pfn.side_effect = RuntimeError("rucio down")
+        run_generation(config, state, mock_rucio)
+        staging_files = os.listdir(config.staging_dir)
+        tmp_files = [f for f in staging_files if ".tmp." in f]
+        assert tmp_files == [], "orphaned staging files: {}".format(tmp_files)

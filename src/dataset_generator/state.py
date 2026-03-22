@@ -51,6 +51,7 @@ completed the ``created`` transition (i.e. entries pre-allocated with
 ``allocate()`` before generation begins).
 """
 
+import copy
 import json
 import logging
 import os
@@ -190,7 +191,6 @@ class StateFile(object):
         a registration batch).
         """
         with self._lock:
-            import copy
             return copy.deepcopy(self._state)
 
     @property
@@ -237,7 +237,8 @@ class StateFile(object):
                 "run_id": self._run_id,
                 "files": {},
             }
-            self._save_locked()
+            with self._lock:
+                self._save_locked()
             log.info("Created new state file: %s", self._path)
 
     def _validate_loaded(self):
@@ -255,7 +256,7 @@ class StateFile(object):
                 "State file {!r} is missing the 'files' dict".format(self._path)
             )
         stored_run_id = self._state.get("run_id")
-        if stored_run_id and stored_run_id != self._run_id:
+        if stored_run_id is not None and stored_run_id != self._run_id:
             raise StateError(
                 "State file run_id {!r} does not match expected {!r}. "
                 "Use --state-file to point to the correct state file, or "
