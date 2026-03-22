@@ -272,12 +272,6 @@ rule_lifetime: ~          # Rule lifetime in seconds; null = permanent
 # Default: 512MiB. Larger values provide greater data variety across files.
 # buffer_reuse_ring_size: 512MiB
 
-# Disable fallocate() pre-allocation when placing files on the RSE.
-# fallocate is enabled by default and tells the OS to reserve disk space before writing,
-# reducing fragmentation and avoiding mid-write ENOSPC on most filesystems.
-# Disable on CephFS (and similar distributed filesystems) where fallocate() fills the
-# allocated space with zeroes instead of merely reserving it, causing unnecessary I/O.
-# fallocate: true
 ```
 
 Any YAML value can be overridden on the command line — see
@@ -566,7 +560,7 @@ All tests run in under ten seconds. No network access or RSE mount is required.
 ```
 usage: dataset-generator [--config PATH] [--dry-run] [--threads N]
                          [--log-level LEVEL] [--state-file PATH] [--run-id ID]
-                         [--check-auth] [--no-fallocate]
+                         [--check-auth]
                          [--create-only | --register-only | --cleanup]
                          [config overrides ...]
 
@@ -610,9 +604,6 @@ Config overrides (all settable in YAML; CLI wins):
                          Ring buffer size for buffer-reuse mode (default: 512MiB).
                          Same unit syntax as --file-size-bytes. Must be >= 128 MiB.
                          Memory footprint per worker process ≈ ring_size + 128 MiB.
-  --no-fallocate         Disable fallocate() pre-allocation when placing files on the RSE.
-                         Recommended on CephFS where fallocate() writes zeros instead of
-                         reserving space. Enabled by default on supporting filesystems.
   --registry-file PATH   Global registry JSON path (default: ~/.rucio-ds-generator/registry.json;
                          set to "" to disable)
   --rucio-host           Rucio server URL

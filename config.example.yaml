@@ -118,13 +118,5 @@ rule_lifetime: ~
 # Examples: 512MiB (default), 1GiB, 2GiB
 # buffer_reuse_ring_size: 512MiB
 
-# posix_fallocate pre-allocation.  Default: true (enabled).
-# Disable on CephFS: on CephFS fallocate writes zeros to disk rather than
-# simply reserving space, making it as slow as a regular write with no
-# benefit.  On ext4/XFS fallocate is near-instant and eliminates
-# extent-allocation overhead during sequential writes.
-# fallocate: true
-# fallocate: false  # use this on CephFS
-
 # Logging level: DEBUG, INFO, WARNING, ERROR
 log_level: "INFO"

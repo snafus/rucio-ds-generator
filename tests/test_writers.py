@@ -14,7 +14,6 @@ from dataset_generator.writers import (
     CsprngFileWriter,
     FileWriter,
     _DEFAULT_RING_SIZE,
-    _HAS_FALLOCATE,
     _MIN_RING_SIZE,
     _RAND_METHOD,
     _WRITER_REGISTRY,
@@ -75,10 +74,6 @@ class TestCsprngFileWriter:
 
     def test_description_contains_chunk_size(self, writer):
         assert "128" in writer.description   # CHUNK_SIZE = 128 MiB
-
-    def test_description_contains_fallocate_status(self, writer):
-        expected = "yes" if _HAS_FALLOCATE else "no"
-        assert "fallocate: {}".format(expected) in writer.description
 
     def test_description_contains_rand_method(self, writer):
         # _RAND_METHOD contains "MT19937" or "CSPRNG" depending on Python version
@@ -141,11 +136,8 @@ class TestCsprngFileWriter:
         assert 0 <= checksum <= 0xFFFFFFFF
 
     def test_thread_safe_no_shared_mutable_state(self, writer):
-        """CsprngFileWriter has only immutable instance state — safe to share across threads."""
-        # _use_fallocate is set once at construction and never mutated.
-        assert isinstance(writer._use_fallocate, bool)
-        # No other instance attributes should exist.
-        assert set(writer.__dict__.keys()) == {"_use_fallocate"}
+        """CsprngFileWriter has no mutable instance state — safe to share across threads."""
+        assert writer.__dict__ == {}
 
 
 # ---------------------------------------------------------------------------
@@ -177,10 +169,6 @@ class TestBufferReuseFileWriter:
 
     def test_description_contains_chunk_size(self, writer):
         assert "128" in writer.description
-
-    def test_description_contains_fallocate_status(self, writer):
-        expected = "yes" if _HAS_FALLOCATE else "no"
-        assert "fallocate: {}".format(expected) in writer.description
 
     def test_write_correct_size(self, tmp_path, writer):
         path = str(tmp_path / "f")
@@ -361,6 +349,3 @@ class TestModuleConstants:
     def test_rand_method_is_string(self):
         assert isinstance(_RAND_METHOD, str)
         assert len(_RAND_METHOD) > 0
-
-    def test_has_fallocate_is_bool(self):
-        assert isinstance(_HAS_FALLOCATE, bool)

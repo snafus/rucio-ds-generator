@@ -220,15 +220,6 @@ def _build_parser():
         ),
     )
     ovr.add_argument(
-        "--no-fallocate", dest="fallocate", action="store_false", default=None,
-        help=(
-            "Disable posix_fallocate pre-allocation. "
-            "Recommended on CephFS where fallocate may write zeros to disk "
-            "rather than simply reserving space, making it as slow as a "
-            "regular write with none of the benefit. Default: enabled."
-        ),
-    )
-    ovr.add_argument(
         "--buffer-reuse-ring-size", dest="buffer_reuse_ring_size", metavar="SIZE",
         help=(
             "Ring buffer size for buffer-reuse mode. "
