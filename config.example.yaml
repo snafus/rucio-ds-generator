@@ -118,5 +118,12 @@ rule_lifetime: ~
 # Examples: 512MiB (default), 1GiB, 2GiB
 # buffer_reuse_ring_size: 512MiB
 
+# Write XrdCks adler32 extended attribute (user.XrdCks.adler32) to each placed
+# file after placement.  XRootD reads this attribute for checksum validation,
+# avoiding a full re-read of the file.  The already-computed adler32 is reused
+# (no extra I/O).  Silently skipped on platforms without os.setxattr (macOS,
+# Windows).  Set to false or pass --no-xattr to disable.
+# xattr: true
+
 # Logging level: DEBUG, INFO, WARNING, ERROR
 log_level: "INFO"

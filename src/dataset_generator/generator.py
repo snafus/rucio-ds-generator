@@ -59,7 +59,9 @@ import logging.handlers
 import multiprocessing
 import os
 import random
+import struct
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import List, Optional
 
@@ -69,6 +71,67 @@ from .state import FileStatus, StateFile
 from .writers import FileWriter, get_file_writer
 
 log = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# XrdCks extended-attribute support
+# ---------------------------------------------------------------------------
+
+#: Extended-attribute key used by XRootD for adler32 checksums.
+#: XrdCksXAttr::Name() returns "XrdCks.<algname>"; the Linux setxattr layer
+#: prepends "user." (XrdSysFAttrLnx.icc, AttrName macro).
+_XRDCKS_XATTR_NAME = "user.XrdCks.adler32"
+
+#: True when the OS supports os.setxattr (Linux kernel 2.6+, Python 3.3+).
+#: On macOS, Windows, or older kernels this is False and xattr writes are
+#: silently skipped regardless of the ``xattr`` config flag.
+_HAS_SETXATTR = hasattr(os, "setxattr")
+
+
+def _set_xrdcks_xattr(path, adler32_int):
+    # type: (str, int) -> None
+    """
+    Write the XRootD ``user.XrdCks.adler32`` extended attribute to *path*.
+
+    XRootD reads this attribute via ``XrdCksXAttr`` and uses it for
+    checksum validation without re-reading the file.  When the stored
+    ``fmTime`` (file-modification time) matches the file's current mtime
+    on disk XRootD trusts the stored checksum; a mismatch causes it to
+    re-checksum the file automatically.
+
+    Blob layout (96 bytes total — ``XrdCksData`` struct)
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    ============  =====  =========  ==============  =====================
+    Field         Bytes  C type     Endian          Content
+    ============  =====  =========  ==============  =====================
+    Name          16     char[16]   n/a             "adler32\\0" + padding
+    fmTime        8      int64      big-endian      file mtime (seconds)
+    csTime        4      int32      big-endian      checksum time (secs)
+    Rsvd1         2      int16      host            reserved (0)
+    Rsvd2         1      uint8      host            reserved (0)
+    Length        1      uint8      host            value length in bytes
+    Value         64     uint8[64]  host (first 4)  adler32 in first 4 B
+    ============  =====  =========  ==============  =====================
+
+    Parameters
+    ----------
+    path:
+        Absolute path to the file on the RSE (after placement/rename).
+    adler32_int:
+        Adler32 checksum of the file as an unsigned 32-bit integer
+        (i.e. ``zlib.adler32(data, 1) & 0xFFFFFFFF``).
+    """
+    now = int(time.time())
+    fm_time = int(os.stat(path).st_mtime)
+    # Name field: "adler32\0" padded to 16 bytes.
+    name_bytes = b"adler32\x00" + b"\x00" * 8  # 16 bytes
+    # fmTime and csTime: big-endian (network byte order) signed integers.
+    times = struct.pack(">qi", fm_time, now)    # 8 + 4 = 12 bytes
+    # Rsvd1 (int16), Rsvd2 (uint8), Length (uint8 = 4): host byte order.
+    meta = struct.pack("=hBB", 0, 0, 4)         # 4 bytes
+    # Value: adler32 in first 4 bytes (host byte order), rest zero-padded.
+    value = struct.pack("=I", adler32_int) + b"\x00" * 60  # 64 bytes
+    blob = name_bytes + times + meta + value    # 16+12+4+64 = 96 bytes
+    os.setxattr(path, _XRDCKS_XATTR_NAME, blob)
 
 
 # ---------------------------------------------------------------------------
@@ -563,6 +626,14 @@ def run_generation(config, state, rucio_manager, new_count=None):
                     bytes=bytes_written2,
                     adler32=checksum_hex2,
                 )
+                if config.xattr and _HAS_SETXATTR:
+                    try:
+                        _set_xrdcks_xattr(local_pfn2, int(checksum_hex2, 16))
+                        log.debug("[file-%06d] XrdCks xattr set: %s",
+                                  idx2, local_pfn2)
+                    except OSError as exc:
+                        log.warning("[file-%06d] XrdCks xattr failed: %s",
+                                    idx2, exc)
                 results.append({
                     "key": key2,
                     "lfn": lfn2,
@@ -616,6 +687,9 @@ def run_generation(config, state, rucio_manager, new_count=None):
                             bytes=bytes_written,
                             adler32=checksum_hex,
                         )
+                        if config.xattr and _HAS_SETXATTR:
+                            log.info("[DRY-RUN] Would set XrdCks xattr: %s",
+                                     local_pfn)
                         results.append({
                             "key": key,
                             "lfn": lfn,

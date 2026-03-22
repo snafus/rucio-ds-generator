@@ -235,6 +235,14 @@ def _build_parser():
             "Set to empty string to disable registry recording.".format(DEFAULT_REGISTRY_FILE)
         ),
     )
+    ovr.add_argument(
+        "--no-xattr", dest="xattr", action="store_false", default=None,
+        help=(
+            "Disable writing the XrdCks adler32 extended attribute "
+            "(user.XrdCks.adler32) to placed files. "
+            "Default: xattr writing is enabled when supported by the OS."
+        ),
+    )
 
     return parser
 

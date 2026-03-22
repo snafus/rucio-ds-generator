@@ -628,3 +628,120 @@ class TestRunGeneration:
         staging_files = os.listdir(config.staging_dir)
         tmp_files = [f for f in staging_files if ".tmp." in f]
         assert tmp_files == [], "orphaned staging files: {}".format(tmp_files)
+
+
+# ---------------------------------------------------------------------------
+# _set_xrdcks_xattr
+# ---------------------------------------------------------------------------
+
+import struct as _struct
+import zlib as _zlib
+from dataset_generator.generator import (
+    _set_xrdcks_xattr,
+    _HAS_SETXATTR,
+    _XRDCKS_XATTR_NAME,
+)
+
+
+@pytest.mark.skipif(not _HAS_SETXATTR, reason="os.setxattr not available on this platform")
+class TestSetXrdcksXattr:
+    def _read_blob(self, path):
+        return os.getxattr(path, _XRDCKS_XATTR_NAME)
+
+    def test_blob_is_96_bytes(self, tmp_path):
+        path = str(tmp_path / "f")
+        open(path, "wb").close()
+        _set_xrdcks_xattr(path, 0xDEADBEEF)
+        assert len(self._read_blob(path)) == 96
+
+    def test_name_field_is_adler32(self, tmp_path):
+        path = str(tmp_path / "f")
+        open(path, "wb").close()
+        _set_xrdcks_xattr(path, 0x12345678)
+        blob = self._read_blob(path)
+        # First 8 bytes are "adler32\0"; next 8 are zero padding.
+        assert blob[:8] == b"adler32\x00"
+        assert blob[8:16] == b"\x00" * 8
+
+    def test_adler32_value_stored_host_order(self, tmp_path):
+        path = str(tmp_path / "f")
+        open(path, "wb").close()
+        adler = 0xCAFEBABE
+        _set_xrdcks_xattr(path, adler)
+        blob = self._read_blob(path)
+        # Value field starts at offset 32; first 4 bytes, host byte order.
+        stored = _struct.unpack("=I", blob[32:36])[0]
+        assert stored == adler
+
+    def test_length_field_is_4(self, tmp_path):
+        path = str(tmp_path / "f")
+        open(path, "wb").close()
+        _set_xrdcks_xattr(path, 1)
+        blob = self._read_blob(path)
+        # Length is the 4th byte of the meta field at offset 28 (after Rsvd1+Rsvd2).
+        # Layout: Rsvd1(2) + Rsvd2(1) + Length(1) at bytes 28-31.
+        length = _struct.unpack("=B", blob[31:32])[0]
+        assert length == 4
+
+    def test_fmtime_big_endian(self, tmp_path):
+        path = str(tmp_path / "f")
+        open(path, "wb").close()
+        _set_xrdcks_xattr(path, 1)
+        blob = self._read_blob(path)
+        fm_time = _struct.unpack(">q", blob[16:24])[0]
+        # fmTime must match the file's mtime (within a 2-second window).
+        assert abs(fm_time - int(os.stat(path).st_mtime)) <= 2
+
+    def test_value_tail_is_zero_padded(self, tmp_path):
+        path = str(tmp_path / "f")
+        open(path, "wb").close()
+        _set_xrdcks_xattr(path, 0xDEADBEEF)
+        blob = self._read_blob(path)
+        # Bytes 36-96 (Value[4:64]) must all be zero.
+        assert blob[36:] == b"\x00" * 60
+
+    def test_xattr_key_name(self, tmp_path):
+        assert _XRDCKS_XATTR_NAME == "user.XrdCks.adler32"
+
+    def test_oserror_propagates(self, tmp_path):
+        """_set_xrdcks_xattr raises OSError when the path does not exist."""
+        with pytest.raises(OSError):
+            _set_xrdcks_xattr(str(tmp_path / "nonexistent"), 1)
+
+
+@pytest.mark.skipif(not _HAS_SETXATTR, reason="os.setxattr not available on this platform")
+class TestXattrIntegration:
+    """Verify xattr is set (or skipped) on files placed by run_generation."""
+
+    def test_xattr_written_when_enabled(self, config, state, mock_rucio):
+        """With config.xattr=True, every placed file gets the xattr."""
+        config.xattr = True
+        run_generation(config, state, mock_rucio)
+        created = state.get_files_by_status(FileStatus.CREATED)
+        assert len(created) == config.num_files
+        for entry in created:
+            blob = os.getxattr(entry["pfn"], _XRDCKS_XATTR_NAME)
+            assert len(blob) == 96
+            # Value field: stored adler32 must match the state entry.
+            stored = _struct.unpack("=I", blob[32:36])[0]
+            assert stored == int(entry["adler32"], 16)
+
+    def test_xattr_not_written_when_disabled(self, config, state, mock_rucio):
+        """With config.xattr=False, no xattr is set on placed files."""
+        config.xattr = False
+        run_generation(config, state, mock_rucio)
+        created = state.get_files_by_status(FileStatus.CREATED)
+        assert len(created) == config.num_files
+        for entry in created:
+            with pytest.raises(OSError):
+                os.getxattr(entry["pfn"], _XRDCKS_XATTR_NAME)
+
+    def test_xattr_oserror_does_not_fail_generation(self, config, state, mock_rucio):
+        """An OSError from setxattr is logged as WARNING but does not abort placement."""
+        config.xattr = True
+        with patch("dataset_generator.generator._set_xrdcks_xattr",
+                   side_effect=OSError("xattr quota exceeded")):
+            results = run_generation(config, state, mock_rucio)
+        assert len(results) == config.num_files
+        created = state.get_files_by_status(FileStatus.CREATED)
+        assert len(created) == config.num_files
