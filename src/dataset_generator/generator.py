@@ -9,7 +9,7 @@ File generation pipeline (per file)
 1. A worker process writes random data to a temp path in ``staging_dir``
    using 128 MiB chunks.  The adler32 checksum is accumulated
    incrementally — the full file is never held in memory.
-2. The worker returns ``(idx, staging_path, checksum_hex, bytes_written)``
+2. The worker returns ``(idx, staging_path, checksum_hex, bytes_written, error_str)``
    to the main process via ``multiprocessing.Pool.imap_unordered``.
 3. The main process derives the LFN: ``{file_prefix}_{adler32_hex}``.
 4. The main process calls ``RucioManager.lfns2pfn`` to resolve the
@@ -296,8 +296,8 @@ def _pfn_to_local(pfn, rse_pfn_prefix, rse_mount):
     return pfn
 
 
-#: Buffer size for the fallback cross-filesystem copy loop.
-#: shutil.copy2 uses 16 KiB on Python 3.6 — 512× fewer syscalls at 8 MiB.
+#: Buffer size for the fallback cross-filesystem copy loop in _copy_file_fast.
+#: 8 MiB gives 512× fewer syscalls than shutil.copy2's 16 KiB default.
 _COPY_BUFSIZE = 8 * 1024 * 1024   # 8 MiB
 
 
@@ -348,7 +348,7 @@ def _place_file(staging_path, local_pfn, uid=None, gid=None):
     1. Move *staging_path* to ``{local_pfn}.part.{pid}.{tid}`` — a temporary
        name *on the RSE filesystem*.  If staging and RSE are on the same
        filesystem ``os.rename`` is used (instant, no data copy).  If they are
-       on different filesystems (``EXDEV``), ``shutil.copy2`` is used followed
+       on different filesystems (``EXDEV``), ``_copy_file_fast`` is used followed
        by removal of the staging file.
     2. Set ownership (uid/gid) on the ``.part`` file while it still has a
        temporary name (ownership is preserved across ``os.rename``).
@@ -392,12 +392,12 @@ def _place_file(staging_path, local_pfn, uid=None, gid=None):
         except Exception:
             try:
                 os.unlink(part_path)
-                log.debug("[%s] _place_file: cleaned up orphaned part after copy2 failure", tname)
+                log.debug("[%s] _place_file: cleaned up orphaned part after copy failure", tname)
             except OSError:
                 pass
             raise
         os.unlink(staging_path)
-        log.debug("[%s] _place_file: staging file removed after copy2", tname)
+        log.debug("[%s] _place_file: staging file removed after fast copy", tname)
 
     # Steps 2 & 3: chown then atomic rename on the RSE filesystem.
     # If either fails the .part file is removed so it does not linger on the RSE.
