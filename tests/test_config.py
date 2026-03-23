@@ -68,6 +68,32 @@ class TestConfigConstruction:
         assert cfg.pool_chunksize == 10
         assert isinstance(cfg.pool_chunksize, int)
 
+    def test_pfn_batch_size_default(self):
+        cfg = _make_config()
+        assert cfg.pfn_batch_size == 1000
+
+    def test_pfn_batch_size_explicit(self):
+        cfg = _make_config(pfn_batch_size=250)
+        assert cfg.pfn_batch_size == 250
+
+    def test_pfn_batch_size_coerced_to_int(self):
+        cfg = _make_config(pfn_batch_size="500")
+        assert cfg.pfn_batch_size == 500
+        assert isinstance(cfg.pfn_batch_size, int)
+
+    def test_state_flush_interval_default(self):
+        cfg = _make_config()
+        assert cfg.state_flush_interval == 100
+
+    def test_state_flush_interval_explicit(self):
+        cfg = _make_config(state_flush_interval=1)
+        assert cfg.state_flush_interval == 1
+
+    def test_state_flush_interval_coerced_to_int(self):
+        cfg = _make_config(state_flush_interval="50")
+        assert cfg.state_flush_interval == 50
+        assert isinstance(cfg.state_flush_interval, int)
+
     def test_run_id_auto_generated(self):
         cfg = _make_config()
         assert len(cfg.run_id) == 12
@@ -382,6 +408,37 @@ class TestValidation:
 
     def test_pool_chunksize_positive_passes(self):
         cfg = _make_config(pool_chunksize=50)
+        cfg.validate()  # should not raise
+
+    def test_pfn_batch_size_negative_raises(self):
+        cfg = _make_config(pfn_batch_size=-1)
+        with pytest.raises(ConfigError, match="pfn_batch_size"):
+            cfg.validate()
+
+    def test_pfn_batch_size_zero_passes(self):
+        cfg = _make_config(pfn_batch_size=0)
+        cfg.validate()  # 0 means all-at-once — must not raise
+
+    def test_pfn_batch_size_positive_passes(self):
+        cfg = _make_config(pfn_batch_size=500)
+        cfg.validate()  # should not raise
+
+    def test_state_flush_interval_zero_raises(self):
+        cfg = _make_config(state_flush_interval=0)
+        with pytest.raises(ConfigError, match="state_flush_interval"):
+            cfg.validate()
+
+    def test_state_flush_interval_negative_raises(self):
+        cfg = _make_config(state_flush_interval=-1)
+        with pytest.raises(ConfigError, match="state_flush_interval"):
+            cfg.validate()
+
+    def test_state_flush_interval_one_passes(self):
+        cfg = _make_config(state_flush_interval=1)
+        cfg.validate()  # 1 = flush every update — must not raise
+
+    def test_state_flush_interval_positive_passes(self):
+        cfg = _make_config(state_flush_interval=200)
         cfg.validate()  # should not raise
 
 
