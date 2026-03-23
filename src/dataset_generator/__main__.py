@@ -255,6 +255,15 @@ def _build_parser():
         ),
     )
     ovr.add_argument(
+        "--pfn-batch-size", dest="pfn_batch_size", type=int, metavar="N",
+        help=(
+            "Number of LFNs resolved per lfns2pfns Rucio API call. "
+            "0: resolve all at once (one call total). "
+            "Default: 1000. Larger values reduce HTTP round-trips but "
+            "increase memory pressure if the Rucio server is slow."
+        ),
+    )
+    ovr.add_argument(
         "--no-xattr", dest="xattr", action="store_false", default=None,
         help=(
             "Disable writing the XrdCks adler32 extended attribute "

@@ -171,6 +171,7 @@ class Config(object):
         "xattr": True,                      # write XrdCks adler32 xattr after placement
         "size_label": "iec",                # unit system for {{ file_size }} template: "iec" or "si"
         "pool_chunksize": 0,                # imap chunksize; 0 = auto (N // threads*4)
+        "pfn_batch_size": 1000,             # LFNs per lfns2pfns_batch call; 0 = all at once
     }
 
     def __init__(
@@ -209,6 +210,7 @@ class Config(object):
         xattr=True,                        # type: bool  Write XrdCks adler32 xattr after placement
         size_label="iec",                  # type: str   Unit system for {{ file_size }}: "iec" or "si"
         pool_chunksize=0,                  # type: int   imap chunksize; 0 = auto
+        pfn_batch_size=1000,               # type: int   LFNs per lfns2pfns_batch call; 0 = all at once
     ):
         self.scope = scope
         self.rse = rse
@@ -249,6 +251,7 @@ class Config(object):
         self.xattr = bool(xattr) if xattr is not None else True
         self.size_label = (size_label or "iec").lower()
         self.pool_chunksize = int(pool_chunksize) if pool_chunksize is not None else 0
+        self.pfn_batch_size = int(pfn_batch_size) if pfn_batch_size is not None else 1000
 
     # ------------------------------------------------------------------
     # Computed properties
@@ -503,6 +506,7 @@ class Config(object):
             xattr=get("xattr"),
             size_label=get("size_label"),
             pool_chunksize=get("pool_chunksize"),
+            pfn_batch_size=get("pfn_batch_size"),
         )
 
     # ------------------------------------------------------------------
@@ -524,6 +528,10 @@ class Config(object):
         if self.pool_chunksize < 0:
             raise ConfigError(
                 "pool_chunksize must be >= 0, got {}".format(self.pool_chunksize)
+            )
+        if self.pfn_batch_size < 0:
+            raise ConfigError(
+                "pfn_batch_size must be >= 0, got {}".format(self.pfn_batch_size)
             )
         if self.create_only and self.register_only:
             raise ConfigError("--create-only and --register-only are mutually exclusive")

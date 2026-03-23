@@ -277,6 +277,50 @@ class RucioManager(object):
 
         return self._retry(_call, "lfns2pfns({!r}, {!r})".format(rse, lfn))
 
+    def lfns2pfns_batch(self, rse, lfns):
+        # type: (str, List[str]) -> Dict[str, str]
+        """
+        Resolve a list of LFN strings to their PFNs on *rse* in one API call.
+
+        Wraps ``lfns2pfns`` on the Rucio ``ReplicaClient`` (which already
+        accepts a list).  For deterministic RSEs the PFNs are derived
+        server-side from the RSE protocol configuration.
+
+        Parameters
+        ----------
+        rse:
+            RSE name.
+        lfns:
+            List of LFN strings in ``"scope:name"`` format.
+
+        Returns
+        -------
+        dict
+            ``{"scope:name": "/pfn/path"}`` mapping for all requested LFNs.
+
+        Raises
+        ------
+        RuntimeError
+            If any of the requested LFNs are absent from the server response.
+        """
+        if not lfns:
+            return {}
+
+        client = self._make_client()
+
+        def _call():
+            result = client.lfns2pfns(rse=rse, lfns=lfns)
+            missing = [lfn for lfn in lfns if lfn not in result]
+            if missing:
+                raise RuntimeError(
+                    "lfns2pfns_batch: no PFN returned for {} LFN(s): {}".format(
+                        len(missing), missing[:5]  # log first 5 to keep message readable
+                    )
+                )
+            return result
+
+        return self._retry(_call, "lfns2pfns_batch({!r}, {} lfns)".format(rse, len(lfns)))
+
     # ------------------------------------------------------------------
     # Dataset operations
     # ------------------------------------------------------------------

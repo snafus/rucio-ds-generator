@@ -666,6 +666,70 @@ def run_generation(config, state, rucio_manager, new_count=None):
                 for future in [f for f in list(pending_placements) if f.done()]:
                     _handle_placement_future(future)
 
+            # -- Batch PFN resolution -----------------------------------------
+
+            # pfn_pending accumulates write results until the batch is full or
+            # all writes finish.  One lfns2pfns_batch call replaces N serial
+            # lfns2pfn calls, reducing HTTP round-trips from O(N) to
+            # O(N/pfn_batch_size).  pfn_batch_size=0 means "all at once".
+            pfn_pending = []  # type: List[tuple]  # (idx, staging, chk, bytes, lfn, lfn_name)
+            _pfn_batch_size = (
+                config.pfn_batch_size if config.pfn_batch_size > 0
+                else len(to_generate) + 1   # larger than total → flush only at end
+            )
+
+            def _flush_pfn_pending():
+                # type: () -> None
+                """Resolve PFNs for all buffered write results and submit placements."""
+                if not pfn_pending:
+                    return
+                lfns = [item[4] for item in pfn_pending]
+                log.debug("Resolving %d PFN(s) in one batch call (rse=%s)",
+                          len(lfns), config.rse)
+                try:
+                    pfn_map = rucio_manager.lfns2pfns_batch(config.rse, lfns)
+                except Exception as exc:
+                    # Entire batch failed — mark all as FAILED_CREATION.
+                    for (bi, bstage, bchk, bbytes, blfn, blfn_name) in pfn_pending:
+                        log.error("[file-%06d] Batch PFN resolution failed: %s", bi, exc)
+                        try:
+                            if bstage and os.path.exists(bstage):
+                                os.unlink(bstage)
+                        except OSError:
+                            pass
+                        state.update(_state_key(bi), status=FileStatus.FAILED_CREATION)
+                        failures.append(bi)
+                        pbar.update(1)
+                    pfn_pending[:] = []
+                    return
+
+                for (bi, bstage, bchk, bbytes, blfn, blfn_name) in pfn_pending:
+                    try:
+                        rucio_pfn = pfn_map[blfn]
+                        local_pfn = _pfn_to_local(
+                            rucio_pfn, config.rse_pfn_prefix, config.rse_mount
+                        )
+                        log.debug("[file-%06d] PFN resolved: rucio=%s local=%s",
+                                  bi, rucio_pfn, local_pfn)
+                        future = placement_executor.submit(
+                            _place_file, bstage, local_pfn,
+                            config.rse_uid, config.rse_gid,
+                        )
+                        pending_placements[future] = (
+                            bi, bstage, bchk, bbytes, blfn, blfn_name, local_pfn,
+                        )
+                    except Exception as exc:
+                        log.error("[file-%06d] Post-write processing failed: %s", bi, exc)
+                        try:
+                            if bstage and os.path.exists(bstage):
+                                os.unlink(bstage)
+                        except OSError:
+                            pass
+                        state.update(_state_key(bi), status=FileStatus.FAILED_CREATION)
+                        failures.append(bi)
+                        pbar.update(1)
+                pfn_pending[:] = []
+
             # -- Main write/placement loop ------------------------------------
 
             # chunksize > 1 batches multiple tasks per pipe transaction,
@@ -693,9 +757,8 @@ def run_generation(config, state, rucio_manager, new_count=None):
                     _collect_done_placements()
                     continue
 
-                # Post-write: PFN resolution runs in the main process
-                # (rucio_manager lives here).  Placement is submitted to the
-                # placement thread pool so it overlaps with the next write.
+                # Post-write: compute LFN then either process immediately
+                # (dry-run) or buffer for batch PFN resolution.
                 try:
                     lfn_name = "{}_{}".format(config.file_prefix, checksum_hex)
                     lfn = "{}:{}".format(config.scope, lfn_name)
@@ -729,28 +792,15 @@ def run_generation(config, state, rucio_manager, new_count=None):
                                  idx, lfn, bytes_written, checksum_hex)
                         pbar.update(1)
                     else:
-                        log.debug("[file-%06d] Resolving PFN: rse=%s lfn=%s",
-                                  idx, config.rse, lfn)
-                        rucio_pfn = rucio_manager.lfns2pfn(config.rse, lfn)
-                        local_pfn = _pfn_to_local(
-                            rucio_pfn, config.rse_pfn_prefix, config.rse_mount
+                        # Buffer this result for batch PFN resolution.
+                        pfn_pending.append(
+                            (idx, staging_path, checksum_hex, bytes_written, lfn, lfn_name)
                         )
-                        log.debug("[file-%06d] PFN resolved: rucio=%s local=%s",
-                                  idx, rucio_pfn, local_pfn)
-                        log.debug("[file-%06d] Submitting placement: %s → %s",
-                                  idx, staging_path, local_pfn)
-                        future = placement_executor.submit(
-                            _place_file, staging_path, local_pfn,
-                            config.rse_uid, config.rse_gid,
-                        )
-                        pending_placements[future] = (
-                            idx, staging_path, checksum_hex,
-                            bytes_written, lfn, lfn_name, local_pfn,
-                        )
+                        if len(pfn_pending) >= _pfn_batch_size:
+                            _flush_pfn_pending()
 
                 except Exception as exc:
                     log.error("[file-%06d] Post-write processing failed: %s", idx, exc)
-                    # Clean up the staging file the worker left behind.
                     try:
                         if staging_path and not config.dry_run \
                                 and os.path.exists(staging_path):
@@ -765,7 +815,9 @@ def run_generation(config, state, rucio_manager, new_count=None):
                 # this write result so the dict stays bounded.
                 _collect_done_placements()
 
-            # All writes finished; wait for any outstanding placements.
+            # All writes finished; flush any remaining buffered PFN resolutions,
+            # then wait for outstanding placements.
+            _flush_pfn_pending()
             for future in list(pending_placements):
                 _handle_placement_future(future)
 
