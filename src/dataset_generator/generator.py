@@ -262,6 +262,38 @@ def _write_one_worker(idx):
         return (idx, None, None, None, str(exc))
 
 
+# ---------------------------------------------------------------------------
+# Directory creation cache — Phase 5 optimisation
+# ---------------------------------------------------------------------------
+
+#: Set of directory paths that have already been created in this process.
+#: ``_place_file`` checks this before calling ``_makedirs_chown`` so that
+#: the syscall sequence (stat + mkdir + chown) is skipped for repeated
+#: paths — common when all files land under the same hash directory tree.
+#: Cleared at the start of ``run_generation`` to avoid stale entries from
+#: a previous call.
+_known_dirs = set()   # type: set
+_known_dirs_lock = threading.Lock()
+
+
+def _ensure_dir(path, uid, gid):
+    # type: (str, Optional[int], Optional[int]) -> None
+    """
+    Create *path* (and parents) unless it is already in the cache.
+
+    Thread-safe: the lock is held for the full check-then-create sequence so
+    two threads arriving simultaneously for the same path serialise — the
+    second thread finds the path in the cache and returns without a syscall.
+    ``_makedirs_chown`` is a handful of stat/mkdir/chown calls (fast, no
+    network I/O), so holding the lock across it does not cause contention.
+    """
+    with _known_dirs_lock:
+        if path in _known_dirs:
+            return
+        _makedirs_chown(path, uid, gid)
+        _known_dirs.add(path)
+
+
 def _makedirs_chown(path, uid, gid):
     # type: (str, Optional[int], Optional[int]) -> None
     """
@@ -435,7 +467,7 @@ def _place_file(staging_path, local_pfn, uid=None, gid=None):
     """
     parent = os.path.dirname(local_pfn)
     if parent:
-        _makedirs_chown(parent, uid, gid)
+        _ensure_dir(parent, uid, gid)
 
     tname = threading.current_thread().name
     part_path = "{}.part.{}.{}".format(local_pfn, os.getpid(), threading.get_ident())
@@ -524,6 +556,12 @@ def run_generation(config, state, rucio_manager, new_count=None):
         Metadata dicts for every successfully generated file (including
         those that were already in ``CREATED`` state from a prior run).
     """
+    # Clear the directory-creation cache at the start of each run so that
+    # tests and sequential calls don't reuse stale entries from a previous run.
+    global _known_dirs
+    with _known_dirs_lock:
+        _known_dirs = set()
+
     if new_count is None:
         total = config.num_files
     else:

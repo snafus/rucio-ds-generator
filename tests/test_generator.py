@@ -17,6 +17,7 @@ import pytest
 import dataset_generator.generator as _gen_module
 from dataset_generator.config import Config
 from dataset_generator.generator import (
+    _ensure_dir,
     _makedirs_chown,
     _pfn_to_local,
     _place_file,
@@ -751,6 +752,90 @@ class TestBatchPfnResolution:
         config.dry_run = True
         run_generation(config, state, mock_rucio)
         mock_rucio.lfns2pfns_batch.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Phase 5 — directory creation cache
+# ---------------------------------------------------------------------------
+
+class TestEnsureDir:
+    """Verify _ensure_dir caches directory creation and skips repeated calls."""
+
+    @pytest.fixture(autouse=True)
+    def clear_cache(self):
+        """Reset the module-level _known_dirs before and after each test."""
+        import dataset_generator.generator as _gm
+        with _gm._known_dirs_lock:
+            _gm._known_dirs = set()
+        yield
+        with _gm._known_dirs_lock:
+            _gm._known_dirs = set()
+
+    def test_creates_directory(self, tmp_path):
+        target = str(tmp_path / "a" / "b")
+        _ensure_dir(target, uid=None, gid=None)
+        assert os.path.isdir(target)
+
+    def test_skips_makedirs_on_second_call(self, tmp_path):
+        """Second call for the same path must not invoke _makedirs_chown again."""
+        target = str(tmp_path / "cached")
+        _ensure_dir(target, uid=None, gid=None)
+
+        with patch("dataset_generator.generator._makedirs_chown") as mock_mkdirs:
+            _ensure_dir(target, uid=None, gid=None)
+        mock_mkdirs.assert_not_called()
+
+    def test_different_paths_both_created(self, tmp_path):
+        a = str(tmp_path / "dir_a")
+        b = str(tmp_path / "dir_b")
+        _ensure_dir(a, uid=None, gid=None)
+        _ensure_dir(b, uid=None, gid=None)
+        assert os.path.isdir(a)
+        assert os.path.isdir(b)
+
+    def test_run_generation_clears_cache_on_start(self, config, state, mock_rucio):
+        """
+        run_generation must reset _known_dirs so sequential calls don't
+        carry stale entries across runs.
+        """
+        import dataset_generator.generator as _gm
+        # Pollute the cache with a fake path
+        with _gm._known_dirs_lock:
+            _gm._known_dirs.add("/fake/path/from/previous/run")
+
+        run_generation(config, state, mock_rucio)
+
+        # After run_generation the fake entry must be gone
+        with _gm._known_dirs_lock:
+            assert "/fake/path/from/previous/run" not in _gm._known_dirs
+
+    def test_makedirs_called_once_per_dir_across_files(
+            self, config, state, mock_rucio):
+        """
+        All files whose PFN lands under the same parent hash dir should
+        trigger _makedirs_chown exactly once, not once per file.
+        """
+        # Make all files resolve to the same parent directory
+        common_parent = os.path.join(config.rse_mount, "test", "common_hash")
+
+        def _batch_all_same_parent(rse, lfns):
+            return {
+                lfn: os.path.join(common_parent, lfn.split(":", 1)[1])
+                for lfn in lfns
+            }
+
+        mock_rucio.lfns2pfns_batch.side_effect = _batch_all_same_parent
+
+        with patch("dataset_generator.generator._makedirs_chown",
+                   wraps=_makedirs_chown) as spy:
+            run_generation(config, state, mock_rucio)
+
+        # common_parent should have been created exactly once
+        calls_for_common = [
+            c for c in spy.call_args_list
+            if c[0][0] == common_parent
+        ]
+        assert len(calls_for_common) == 1
 
 
 # ---------------------------------------------------------------------------
