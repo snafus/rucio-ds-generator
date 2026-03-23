@@ -151,8 +151,8 @@ rule_lifetime: ~
 
 # Number of LFNs resolved per lfns2pfns Rucio API call.
 # 0: resolve all LFNs in a single call (lowest HTTP round-trip count).
-# Default: 1000 — balances round-trip count against per-call latency on slow servers.
-# pfn_batch_size: 1000
+# Default: 100 — balances round-trip count against per-call latency on slow servers.
+# pfn_batch_size: 100
 
 # Number of state.update() calls between state-file disk writes.
 # 1 (fully synchronous): writes on every update — safest; slowest at 100 k files.

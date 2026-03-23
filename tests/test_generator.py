@@ -715,8 +715,8 @@ class TestBatchPfnResolution:
 
     def test_all_files_resolved_in_single_batch_by_default(
             self, config, state, mock_rucio):
-        """With pfn_batch_size=1000 (default) and 3 files, one batch call suffices."""
-        config.pfn_batch_size = 1000  # default — larger than num_files=3
+        """With pfn_batch_size=100 (default) and 3 files, one batch call suffices."""
+        config.pfn_batch_size = 100  # default — larger than num_files=3
         run_generation(config, state, mock_rucio)
         assert mock_rucio.lfns2pfns_batch.call_count == 1
         # All 3 LFNs were in the single call

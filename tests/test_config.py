@@ -70,7 +70,7 @@ class TestConfigConstruction:
 
     def test_pfn_batch_size_default(self):
         cfg = _make_config()
-        assert cfg.pfn_batch_size == 1000
+        assert cfg.pfn_batch_size == 100
 
     def test_pfn_batch_size_explicit(self):
         cfg = _make_config(pfn_batch_size=250)
