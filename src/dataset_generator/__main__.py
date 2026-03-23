@@ -236,6 +236,17 @@ def _build_parser():
         ),
     )
     ovr.add_argument(
+        "--size-label", dest="size_label", choices=["iec", "si"], metavar="SYSTEM",
+        help=(
+            "Unit system for the {{ file_size }} template variable used in dataset "
+            "and file prefix names. "
+            "'iec' (default): binary powers of 1024 — KiB, MiB, GiB, TiB. "
+            "'si': decimal powers of 1000 — KB, MB, GB, TB. "
+            "Both {{ file_size_iec }} and {{ file_size_si }} are always available "
+            "in templates regardless of this setting."
+        ),
+    )
+    ovr.add_argument(
         "--no-xattr", dest="xattr", action="store_false", default=None,
         help=(
             "Disable writing the XrdCks adler32 extended attribute "
