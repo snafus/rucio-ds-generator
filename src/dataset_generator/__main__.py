@@ -767,10 +767,17 @@ def main():
             failures = _run_full_pipeline(config, state, rucio_manager, registry=registry)
     except KeyboardInterrupt:
         log.warning("Interrupted — state saved to %s", config.state_file_path)
+        state.flush()
         sys.exit(1)
     except Exception as exc:
         log.exception("Unhandled error: %s", exc)
+        state.flush()
         sys.exit(1)
+    else:
+        # Normal exit: flush any state updates buffered by flush_interval
+        # (registration/rule updates in _register_replicas and pipeline functions).
+        # run_generation already flushes its own updates; this covers phases 2–3.
+        state.flush()
 
     if failures:
         log.warning("Run finished with %d failure(s). State: %s", failures, config.state_file_path)
