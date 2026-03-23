@@ -110,6 +110,56 @@ class TestAllocate:
 
 
 # ---------------------------------------------------------------------------
+# AllocateBatch
+# ---------------------------------------------------------------------------
+
+class TestAllocateBatch:
+    def test_allocates_all_keys(self, state):
+        keys = ["file_{:06d}".format(i) for i in range(5)]
+        state.allocate_batch(keys)
+        for k in keys:
+            entry = state.get_file(k)
+            assert entry is not None
+            assert entry["status"] == FileStatus.PENDING
+
+    def test_returns_count_of_new_keys(self, state):
+        keys = ["file_{:06d}".format(i) for i in range(4)]
+        added = state.allocate_batch(keys)
+        assert added == 4
+
+    def test_idempotent_skips_existing_keys(self, state):
+        state.allocate("file_000000")
+        state.update("file_000000", status=FileStatus.CREATED)
+        added = state.allocate_batch(["file_000000", "file_000001"])
+        assert added == 1   # only file_000001 was new
+        # Existing entry must not be overwritten
+        assert state.get_file("file_000000")["status"] == FileStatus.CREATED
+
+    def test_single_disk_write_for_n_keys(self, state, state_path):
+        """After allocate_batch the file contains all N entries."""
+        keys = ["file_{:06d}".format(i) for i in range(10)]
+        state.allocate_batch(keys)
+        with open(state_path) as fh:
+            data = json.load(fh)
+        for k in keys:
+            assert k in data["files"]
+
+    def test_empty_batch_returns_zero(self, state):
+        added = state.allocate_batch([])
+        assert added == 0
+
+    def test_all_already_exist_returns_zero(self, state):
+        state.allocate("file_000000")
+        added = state.allocate_batch(["file_000000"])
+        assert added == 0
+
+    def test_no_tmp_file_left_behind(self, state, state_path, tmp_path):
+        state.allocate_batch(["file_000000", "file_000001"])
+        tmp_files = [f for f in os.listdir(tmp_path) if f.endswith(".tmp")]
+        assert tmp_files == []
+
+
+# ---------------------------------------------------------------------------
 # Update
 # ---------------------------------------------------------------------------
 

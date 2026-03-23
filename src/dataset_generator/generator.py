@@ -530,8 +530,9 @@ def run_generation(config, state, rucio_manager, new_count=None):
         total = state.count() + new_count
 
     # Pre-allocate state entries for all expected files so resume logic works.
-    for idx in range(total):
-        state.allocate(_state_key(idx))
+    # allocate_batch performs a single JSON write regardless of N, avoiding
+    # the O(N²) total-bytes-written cost of N individual allocate() calls.
+    state.allocate_batch([_state_key(idx) for idx in range(total)])
 
     # Determine which files still need generation.
     done_statuses = {FileStatus.CREATED, FileStatus.REGISTERED, FileStatus.RULED}

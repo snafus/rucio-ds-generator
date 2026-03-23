@@ -127,6 +127,36 @@ class StateFile(object):
                 self._state["files"][key] = {"status": FileStatus.PENDING}
                 self._save_locked()
 
+    def allocate_batch(self, keys):
+        # type: (List[str]) -> int
+        """
+        Pre-allocate state entries for all *keys* in a single atomic write.
+
+        Idempotent: keys that already exist are silently skipped.  Only one
+        JSON serialisation and one ``os.rename`` are performed regardless of
+        how many keys are new — O(1) I/O instead of O(N) for
+        ``allocate()``-in-a-loop.
+
+        Parameters
+        ----------
+        keys:
+            Sequence of state keys to allocate (e.g. ``["file_000000", ...]``).
+
+        Returns
+        -------
+        int
+            Number of keys that were newly added (0 if all already existed).
+        """
+        with self._lock:
+            added = 0
+            for key in keys:
+                if key not in self._state["files"]:
+                    self._state["files"][key] = {"status": FileStatus.PENDING}
+                    added += 1
+            if added:
+                self._save_locked()
+        return added
+
     def update(self, key, **fields):
         # type: (str, **object) -> None
         """
