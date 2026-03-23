@@ -528,6 +528,70 @@ class TestNamingTemplates:
         from dataset_generator.config import _human_size
         assert _human_size(1024 ** 4) == "1TiB"
 
+    # SI mode
+    def test_human_size_si_bytes(self):
+        from dataset_generator.config import _human_size
+        assert _human_size(512, si=True) == "512B"
+
+    def test_human_size_si_kb(self):
+        from dataset_generator.config import _human_size
+        assert _human_size(2000, si=True) == "2KB"
+
+    def test_human_size_si_mb(self):
+        from dataset_generator.config import _human_size
+        assert _human_size(1_000_000, si=True) == "1MB"
+
+    def test_human_size_si_gb(self):
+        from dataset_generator.config import _human_size
+        assert _human_size(1_000_000_000, si=True) == "1GB"
+
+    def test_human_size_si_tb(self):
+        from dataset_generator.config import _human_size
+        assert _human_size(1_000_000_000_000, si=True) == "1TB"
+
+    def test_human_size_si_gib_size_in_si(self):
+        """1 GiB expressed in SI rounds to 1 GB (1073741824 / 10^9 = 1.07...)."""
+        from dataset_generator.config import _human_size
+        assert _human_size(1024 ** 3, si=True) == "1GB"
+
+    # ------------------------------------------------------------------
+    # size_label config and template variables
+    # ------------------------------------------------------------------
+
+    def test_size_label_default_is_iec(self):
+        cfg = self._cfg()
+        assert cfg.size_label == "iec"
+
+    def test_file_size_template_default_is_iec(self):
+        cfg = self._cfg(file_prefix="f_{{ file_size }}", file_size_bytes=1024 ** 3)
+        assert cfg.file_prefix == "f_1GiB"
+
+    def test_file_size_template_si(self):
+        cfg = self._cfg(file_prefix="f_{{ file_size }}", file_size_bytes=1_000_000_000,
+                        size_label="si")
+        assert cfg.file_prefix == "f_1GB"
+
+    def test_file_size_iec_always_available(self):
+        """{{ file_size_iec }} is always IEC regardless of size_label."""
+        cfg = self._cfg(file_prefix="{{ file_size_iec }}", file_size_bytes=1024 ** 3,
+                        size_label="si")
+        assert cfg.file_prefix == "1GiB"
+
+    def test_file_size_si_always_available(self):
+        """{{ file_size_si }} is always SI regardless of size_label."""
+        cfg = self._cfg(file_prefix="{{ file_size_si }}", file_size_bytes=1_000_000_000,
+                        size_label="iec")
+        assert cfg.file_prefix == "1GB"
+
+    def test_size_label_case_insensitive(self):
+        cfg = self._cfg(size_label="SI")
+        assert cfg.size_label == "si"
+
+    def test_size_label_invalid_raises_on_validate(self):
+        cfg = self._cfg(size_label="binary")
+        with pytest.raises(ConfigError, match="size_label"):
+            cfg.validate()
+
     # ------------------------------------------------------------------
     # file_prefix cache
     # ------------------------------------------------------------------

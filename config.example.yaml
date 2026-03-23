@@ -24,7 +24,10 @@ rse_mount: "/mnt/rse/T2_US_EXAMPLE"
 #   {{ scope }}          Rucio scope
 #   {{ rse }}            Target RSE name
 #   {{ num_files }}      Number of files (integer)
-#   {{ file_size }}      Human-readable file size (e.g. 1GiB, 512MiB)
+#   {{ file_size }}      Human-readable file size using the selected unit system
+#                        (e.g. 1GiB or 1GB depending on size_label; see below)
+#   {{ file_size_iec }}  File size always in IEC binary units (e.g. 1GiB, 512MiB)
+#   {{ file_size_si }}   File size always in SI decimal units (e.g. 1GB, 536MB)
 #   {{ file_size_bytes}} Raw file size in bytes
 #   {{ dataset_prefix }} Dataset prefix string
 #
@@ -117,6 +120,15 @@ rule_lifetime: ~
 # IEC units (binary): KiB = 1024, MiB = 1024², GiB = 1024³
 # Examples: 512MiB (default), 1GiB, 2GiB
 # buffer_reuse_ring_size: 512MiB
+
+# Unit system used for the {{ file_size }} Jinja2 template variable in dataset
+# and file prefix names.
+#   iec (default): binary powers of 1024 — KiB, MiB, GiB, TiB, PiB
+#   si:            decimal powers of 1000 — KB,  MB,  GB,  TB,  PB
+# Note: {{ file_size_iec }} and {{ file_size_si }} are always available in
+# templates regardless of this setting, so you can mix both in a single name:
+#   dataset_name: "{{ dataset_prefix }}_{{ file_size_si }}_{{ date }}"
+# size_label: iec
 
 # Write XrdCks adler32 extended attribute (user.XrdCks.adler32) to each placed
 # file after placement.  XRootD reads this attribute for checksum validation,

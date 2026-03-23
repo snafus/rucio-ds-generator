@@ -25,20 +25,31 @@ import yaml
 from jinja2 import Template, TemplateError
 
 
-def _human_size(size_bytes):
-    # type: (int) -> str
+def _human_size(size_bytes, si=False):
+    # type: (int, bool) -> str
     """Return *size_bytes* as a compact human-readable string.
 
-    Examples: ``1B``, ``512KiB``, ``64MiB``, ``1GiB``, ``2TiB``.
+    When *si* is ``False`` (default, IEC): powers of 1024 with binary
+    suffixes — e.g. ``512B``, ``2KiB``, ``64MiB``, ``1GiB``, ``2TiB``.
+
+    When *si* is ``True`` (SI): powers of 1000 with decimal suffixes —
+    e.g. ``512B``, ``2KB``, ``64MB``, ``1GB``, ``2TB``.
+
     Values are always formatted as integers (no decimal point) so the
     result is safe to embed in Rucio DID names.
     """
+    if si:
+        divisor = 1000.0
+        units = ("B", "KB", "MB", "GB", "TB", "PB")
+    else:
+        divisor = 1024.0
+        units = ("B", "KiB", "MiB", "GiB", "TiB", "PiB")
     value = float(size_bytes)
-    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
-        if value < 1024.0:
+    for unit in units[:-1]:
+        if value < divisor:
             return "{}{}".format(int(value), unit)
-        value /= 1024.0
-    return "{}PiB".format(int(value))
+        value /= divisor
+    return "{}{}".format(int(value), units[-1])
 
 
 # SI (decimal, powers of 1000): KB, MB, GB, TB, PB
@@ -158,6 +169,7 @@ class Config(object):
         "generation_mode": "csprng",        # FileWriter back-end; see writers.py
         "buffer_reuse_ring_size": "512MiB", # ring buffer size for buffer-reuse mode
         "xattr": True,                      # write XrdCks adler32 xattr after placement
+        "size_label": "iec",                # unit system for {{ file_size }} template: "iec" or "si"
     }
 
     def __init__(
@@ -194,6 +206,7 @@ class Config(object):
         generation_mode="csprng",          # type: str  FileWriter back-end key; see writers.py
         buffer_reuse_ring_size="512MiB",   # type: object  Ring size for buffer-reuse mode
         xattr=True,                        # type: bool  Write XrdCks adler32 xattr after placement
+        size_label="iec",                  # type: str   Unit system for {{ file_size }}: "iec" or "si"
     ):
         self.scope = scope
         self.rse = rse
@@ -232,6 +245,7 @@ class Config(object):
             buffer_reuse_ring_size if buffer_reuse_ring_size is not None else "512MiB"
         )
         self.xattr = bool(xattr) if xattr is not None else True
+        self.size_label = (size_label or "iec").lower()
 
     # ------------------------------------------------------------------
     # Computed properties
@@ -334,13 +348,25 @@ class Config(object):
         ``num_files``
             Number of files to generate (integer).
         ``file_size``
-            Human-readable file size (e.g. ``1GiB``, ``512MiB``).
+            Human-readable file size using the unit system selected by
+            ``size_label`` (default ``iec``).  E.g. ``1GiB`` (IEC) or
+            ``1GB`` (SI).
+        ``file_size_iec``
+            Human-readable file size always in IEC binary units
+            (KiB / MiB / GiB / TiB / PiB).  Available regardless of
+            the ``size_label`` setting.
+        ``file_size_si``
+            Human-readable file size always in SI decimal units
+            (KB / MB / GB / TB / PB).  Available regardless of the
+            ``size_label`` setting.
         ``file_size_bytes``
             Raw file size in bytes (integer).
         ``dataset_prefix``
             Dataset prefix string (useful in ``dataset_name`` templates).
         """
         now = datetime.now(timezone.utc)
+        _iec = _human_size(self.file_size_bytes, si=False)
+        _si  = _human_size(self.file_size_bytes, si=True)
         return {
             "date":            now.strftime("%Y%m%d"),
             "datetime":        now.strftime("%Y%m%d_%H%M%S"),
@@ -349,7 +375,9 @@ class Config(object):
             "scope":           self.scope,
             "rse":             self.rse,
             "num_files":       self.num_files,
-            "file_size":       _human_size(self.file_size_bytes),
+            "file_size":       _si if self.size_label == "si" else _iec,
+            "file_size_iec":   _iec,
+            "file_size_si":    _si,
             "file_size_bytes": self.file_size_bytes,
             "dataset_prefix":  self.dataset_prefix,
         }
@@ -470,6 +498,7 @@ class Config(object):
             generation_mode=get("generation_mode"),
             buffer_reuse_ring_size=get("buffer_reuse_ring_size"),
             xattr=get("xattr"),
+            size_label=get("size_label"),
         )
 
     # ------------------------------------------------------------------
@@ -484,6 +513,10 @@ class Config(object):
 
         Call this after construction and before starting any work.
         """
+        if self.size_label not in ("iec", "si"):
+            raise ConfigError(
+                "size_label must be 'iec' or 'si', got {!r}".format(self.size_label)
+            )
         if self.create_only and self.register_only:
             raise ConfigError("--create-only and --register-only are mutually exclusive")
         if self.cleanup and (self.create_only or self.register_only):
