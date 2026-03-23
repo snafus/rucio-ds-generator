@@ -137,5 +137,28 @@ rule_lifetime: ~
 # Windows).  Set to false or pass --no-xattr to disable.
 # xattr: true
 
+# ---- 100 k-file scale performance tuning ------------------------------------
+#
+# These three parameters are primarily relevant when generating very large file
+# counts (10 k+).  The defaults are conservative and safe for all run sizes.
+
+# imap task batch size sent to each Pool A worker per IPC round-trip.
+# 0 (default): auto-computed as max(1, num_files // (threads * 4)), which keeps
+#   each worker's queue topped up without pre-loading so many tasks that progress
+#   reporting becomes coarse.
+# Increase for large file counts (> 10 k) if IPC overhead appears in profiles.
+# pool_chunksize: 0
+
+# Number of LFNs resolved per lfns2pfns Rucio API call.
+# 0: resolve all LFNs in a single call (lowest HTTP round-trip count).
+# Default: 1000 — balances round-trip count against per-call latency on slow servers.
+# pfn_batch_size: 1000
+
+# Number of state.update() calls between state-file disk writes.
+# 1 (fully synchronous): writes on every update — safest; slowest at 100 k files.
+# 100 (default): one disk write per 100 updates — good balance of safety and speed.
+# Higher values reduce I/O but risk losing more progress on a hard crash.
+# state_flush_interval: 100
+
 # Logging level: DEBUG, INFO, WARNING, ERROR
 log_level: "INFO"

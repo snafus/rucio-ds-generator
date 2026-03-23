@@ -306,6 +306,11 @@ class RucioManager(object):
         if not lfns:
             return {}
 
+        # _make_client() is called once outside the retry closure — consistent
+        # with the pattern in lfns2pfn above.  The client object holds a cached
+        # auth token; calling _make_client() inside _retry would recreate it on
+        # every attempt, discarding the token and causing unnecessary re-auth
+        # round-trips.  _retry only re-invokes _call(), not _make_client().
         client = self._make_client()
 
         def _call():

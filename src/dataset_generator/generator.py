@@ -864,8 +864,28 @@ def run_generation(config, state, rucio_manager, new_count=None):
     except BaseException:   # Fix 1: catches KeyboardInterrupt, SystemExit, etc.
         log.warning("Interrupted — terminating worker pool")
         pool.terminate()
+        # Clean up staging files that were buffered in pfn_pending but never
+        # had their PFNs resolved (and therefore never submitted to the
+        # placement executor).  We do NOT call Rucio here — only unlink the
+        # local staging file so it does not linger until atexit cleanup.
+        for (bi, bstage, _bchk, _bbytes, _blfn, _blfn_name) in pfn_pending:
+            try:
+                if bstage and os.path.exists(bstage):
+                    os.unlink(bstage)
+                    log.debug("[file-%06d] Cleaned up orphaned staging file: %s",
+                              bi, bstage)
+            except OSError:
+                pass
+        pfn_pending[:] = []
         # Flush any buffered state updates so resume does not re-process
         # files that were already created before the interrupt.
+        # NOTE: in-flight placement futures submitted to placement_executor
+        # before the interrupt may still be running; their state updates will
+        # complete when placement_executor.shutdown(wait=True) runs in the
+        # finally block below.  The flush here captures the pre-interrupt
+        # state; a subsequent flush after shutdown would be needed to capture
+        # those outcomes, but since pool.terminate() prevents new work the
+        # resume path will retry any placements whose state was not flushed.
         state.flush()
         raise
 
