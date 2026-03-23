@@ -99,12 +99,21 @@ class StateFile(object):
         Absolute or relative path to the ``state_{run_id}.json`` file.
     run_id:
         Run identifier string.  Used to cross-check the state file on load.
+    flush_interval:
+        Number of ``update()`` calls between automatic disk flushes.
+        ``1`` (default) writes on every update — safe for small file counts.
+        Values ``> 1`` enable write-behind buffering: in-memory state is
+        updated immediately but only flushed every *flush_interval* calls.
+        The caller **must** call ``flush()`` after the main loop to ensure
+        no updates are lost.  ``flush()`` is a no-op if the buffer is clean.
     """
 
-    def __init__(self, path, run_id):
-        # type: (str, str) -> None
+    def __init__(self, path, run_id, flush_interval=1):
+        # type: (str, str, int) -> None
         self._path = path
         self._run_id = run_id
+        self._flush_interval = max(1, int(flush_interval))
+        self._dirty = 0  # updates since last flush; reset by _save_locked()
         self._lock = threading.Lock()
         self._state = {}  # type: dict  # in-memory representation
         self._load_or_create()
@@ -160,11 +169,17 @@ class StateFile(object):
     def update(self, key, **fields):
         # type: (str, **object) -> None
         """
-        Update fields of an existing state entry and persist immediately.
+        Update fields of an existing state entry, flushing based on
+        ``flush_interval``.
 
         The ``key`` must already exist (created by ``allocate``).  Passing
         ``status=FileStatus.CREATED`` alongside ``lfn``, ``bytes``, etc. is
         the canonical pattern after a file is successfully generated.
+
+        When ``flush_interval > 1`` the change is applied to the in-memory
+        state immediately but only written to disk every *flush_interval*
+        calls.  Call ``flush()`` after the main loop to guarantee the final
+        batch is persisted.
 
         Parameters
         ----------
@@ -178,7 +193,25 @@ class StateFile(object):
             if key not in self._state["files"]:
                 raise StateError("State key {!r} has not been allocated".format(key))
             self._state["files"][key].update(fields)
-            self._save_locked()
+            self._dirty += 1
+            if self._dirty >= self._flush_interval:
+                self._save_locked()
+                self._dirty = 0
+
+    def flush(self):
+        # type: () -> None
+        """
+        Force an immediate disk write if there are any unflushed updates.
+
+        This is a no-op when ``flush_interval == 1`` (every update already
+        flushes) or when the buffer is clean (``_dirty == 0``).  Call this
+        after the main generation loop and in any interrupt handler to ensure
+        no in-memory state is lost.
+        """
+        with self._lock:
+            if self._dirty > 0:
+                self._save_locked()
+                self._dirty = 0
 
     def count(self):
         # type: () -> int

@@ -255,6 +255,14 @@ def _build_parser():
         ),
     )
     ovr.add_argument(
+        "--state-flush-interval", dest="state_flush_interval", type=int, metavar="N",
+        help=(
+            "Write the state file to disk every N update() calls (default: 100). "
+            "1 flushes on every update (safe but slow at 100k files). "
+            "Higher values reduce I/O at the cost of losing more progress on crash."
+        ),
+    )
+    ovr.add_argument(
         "--pfn-batch-size", dest="pfn_batch_size", type=int, metavar="N",
         help=(
             "Number of LFNs resolved per lfns2pfns Rucio API call. "
@@ -683,7 +691,11 @@ def main():
     # Load or create state file.
     # ------------------------------------------------------------------
     try:
-        state = StateFile(path=config.state_file_path, run_id=config.run_id)
+        state = StateFile(
+            path=config.state_file_path,
+            run_id=config.run_id,
+            flush_interval=config.state_flush_interval,
+        )
     except Exception as exc:
         log.error("State file error: %s", exc)
         sys.exit(2)

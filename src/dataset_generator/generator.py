@@ -826,6 +826,9 @@ def run_generation(config, state, rucio_manager, new_count=None):
     except BaseException:   # Fix 1: catches KeyboardInterrupt, SystemExit, etc.
         log.warning("Interrupted — terminating worker pool")
         pool.terminate()
+        # Flush any buffered state updates so resume does not re-process
+        # files that were already created before the interrupt.
+        state.flush()
         raise
 
     finally:
@@ -835,6 +838,10 @@ def run_generation(config, state, rucio_manager, new_count=None):
         # or fail cleanly, preventing orphaned .part files on the RSE.
         placement_executor.shutdown(wait=True)
         listener.stop()
+
+    # Flush any buffered state updates that were held back by flush_interval.
+    # In the flush_interval=1 case this is a no-op (dirty==0).
+    state.flush()
 
     if failures:
         log.warning(
