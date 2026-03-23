@@ -170,6 +170,7 @@ class Config(object):
         "buffer_reuse_ring_size": "512MiB", # ring buffer size for buffer-reuse mode
         "xattr": True,                      # write XrdCks adler32 xattr after placement
         "size_label": "iec",                # unit system for {{ file_size }} template: "iec" or "si"
+        "pool_chunksize": 0,                # imap chunksize; 0 = auto (N // threads*4)
     }
 
     def __init__(
@@ -207,6 +208,7 @@ class Config(object):
         buffer_reuse_ring_size="512MiB",   # type: object  Ring size for buffer-reuse mode
         xattr=True,                        # type: bool  Write XrdCks adler32 xattr after placement
         size_label="iec",                  # type: str   Unit system for {{ file_size }}: "iec" or "si"
+        pool_chunksize=0,                  # type: int   imap chunksize; 0 = auto
     ):
         self.scope = scope
         self.rse = rse
@@ -246,6 +248,7 @@ class Config(object):
         )
         self.xattr = bool(xattr) if xattr is not None else True
         self.size_label = (size_label or "iec").lower()
+        self.pool_chunksize = int(pool_chunksize) if pool_chunksize is not None else 0
 
     # ------------------------------------------------------------------
     # Computed properties
@@ -499,6 +502,7 @@ class Config(object):
             buffer_reuse_ring_size=get("buffer_reuse_ring_size"),
             xattr=get("xattr"),
             size_label=get("size_label"),
+            pool_chunksize=get("pool_chunksize"),
         )
 
     # ------------------------------------------------------------------
@@ -516,6 +520,10 @@ class Config(object):
         if self.size_label not in ("iec", "si"):
             raise ConfigError(
                 "size_label must be 'iec' or 'si', got {!r}".format(self.size_label)
+            )
+        if self.pool_chunksize < 0:
+            raise ConfigError(
+                "pool_chunksize must be >= 0, got {}".format(self.pool_chunksize)
             )
         if self.create_only and self.register_only:
             raise ConfigError("--create-only and --register-only are mutually exclusive")

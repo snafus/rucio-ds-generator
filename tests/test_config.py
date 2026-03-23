@@ -53,6 +53,20 @@ class TestConfigConstruction:
         assert cfg.create_only is False
         assert cfg.register_only is False
         assert cfg.cleanup is False
+        assert cfg.pool_chunksize == 0
+
+    def test_pool_chunksize_default_is_zero(self):
+        cfg = _make_config()
+        assert cfg.pool_chunksize == 0
+
+    def test_pool_chunksize_explicit_stored(self):
+        cfg = _make_config(pool_chunksize=25)
+        assert cfg.pool_chunksize == 25
+
+    def test_pool_chunksize_coerced_to_int(self):
+        cfg = _make_config(pool_chunksize="10")
+        assert cfg.pool_chunksize == 10
+        assert isinstance(cfg.pool_chunksize, int)
 
     def test_run_id_auto_generated(self):
         cfg = _make_config()
@@ -356,6 +370,19 @@ class TestValidation:
     def test_dry_run_skips_mount_check(self):
         cfg = _make_config(rse_mount="/nonexistent_path_xyz", dry_run=True)
         cfg.validate()  # should not raise — dry_run skips mount check
+
+    def test_pool_chunksize_negative_raises(self):
+        cfg = _make_config(pool_chunksize=-1)
+        with pytest.raises(ConfigError, match="pool_chunksize"):
+            cfg.validate()
+
+    def test_pool_chunksize_zero_passes(self):
+        cfg = _make_config(pool_chunksize=0)
+        cfg.validate()  # 0 means auto-compute — must not raise
+
+    def test_pool_chunksize_positive_passes(self):
+        cfg = _make_config(pool_chunksize=50)
+        cfg.validate()  # should not raise
 
 
 # ---------------------------------------------------------------------------

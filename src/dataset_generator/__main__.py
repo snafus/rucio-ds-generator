@@ -247,6 +247,14 @@ def _build_parser():
         ),
     )
     ovr.add_argument(
+        "--pool-chunksize", dest="pool_chunksize", type=int, metavar="N",
+        help=(
+            "Number of file-generation tasks sent to each worker per IPC round-trip. "
+            "0 (default): auto-computed as max(1, num_files // (threads * 4)). "
+            "Increase for large file counts (>10k) to reduce IPC overhead."
+        ),
+    )
+    ovr.add_argument(
         "--no-xattr", dest="xattr", action="store_false", default=None,
         help=(
             "Disable writing the XrdCks adler32 extended attribute "

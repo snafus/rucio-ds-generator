@@ -188,7 +188,11 @@ def _worker_init(config, log_queue):
     root = logging.getLogger()
     root.handlers = []
     root.addHandler(logging.handlers.QueueHandler(log_queue))
-    root.setLevel(logging.DEBUG)
+    # Use the configured log level so DEBUG records are not created (and
+    # therefore not pickled, queued, and unpickled) when the operator has
+    # selected INFO or higher.  Previously hardcoded to DEBUG, which caused
+    # ~4 × N unnecessary LogRecord objects crossing the IPC pipe.
+    root.setLevel(getattr(logging, config.log_level, logging.INFO))
 
     _proc_config = config
     # IMPORTANT: random.seed() above MUST be called before get_file_writer()
@@ -588,12 +592,21 @@ def run_generation(config, state, rucio_manager, new_count=None):
     pending_placements = {}  # type: dict
 
     try:
+        # Read terminal width once; avoid per-update ioctl(TIOCGWINSZ) calls
+        # from dynamic_ncols=True which issues a syscall on every pbar.update().
+        # mininterval=0.5 limits redraws to twice per second regardless of
+        # how many updates arrive — important at 100k+ files/s.
+        try:
+            _ncols = os.get_terminal_size().columns
+        except OSError:
+            _ncols = 80
         with tqdm(
             total=total,
             initial=len(already_done),
             unit="file",
             desc="Generating",
-            dynamic_ncols=True,
+            ncols=_ncols,
+            mininterval=0.5,
         ) as pbar:
             # -- Placement helpers (closures over pbar and shared state) ------
 
@@ -654,7 +667,20 @@ def run_generation(config, state, rucio_manager, new_count=None):
 
             # -- Main write/placement loop ------------------------------------
 
-            for result_tuple in pool.imap_unordered(_write_one_worker, to_generate):
+            # chunksize > 1 batches multiple tasks per pipe transaction,
+            # reducing IPC overhead from O(N) round-trips to O(N/chunksize).
+            # Formula: enough chunks that each worker always has work queued
+            # (4 chunks per worker) without pre-loading so many tasks that
+            # progress reporting becomes coarse.  Minimum 1 (single-file runs).
+            _chunksize = config.pool_chunksize
+            if _chunksize == 0:
+                _chunksize = max(1, len(to_generate) // (config.threads * 4))
+            log.debug("imap_unordered chunksize=%d (%d tasks, %d workers)",
+                      _chunksize, len(to_generate), config.threads)
+
+            for result_tuple in pool.imap_unordered(
+                _write_one_worker, to_generate, chunksize=_chunksize
+            ):
                 idx, staging_path, checksum_hex, bytes_written, error_str = result_tuple
                 key = _state_key(idx)
 
