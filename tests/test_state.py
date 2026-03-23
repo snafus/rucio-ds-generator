@@ -110,6 +110,56 @@ class TestAllocate:
 
 
 # ---------------------------------------------------------------------------
+# AllocateBatch
+# ---------------------------------------------------------------------------
+
+class TestAllocateBatch:
+    def test_allocates_all_keys(self, state):
+        keys = ["file_{:06d}".format(i) for i in range(5)]
+        state.allocate_batch(keys)
+        for k in keys:
+            entry = state.get_file(k)
+            assert entry is not None
+            assert entry["status"] == FileStatus.PENDING
+
+    def test_returns_count_of_new_keys(self, state):
+        keys = ["file_{:06d}".format(i) for i in range(4)]
+        added = state.allocate_batch(keys)
+        assert added == 4
+
+    def test_idempotent_skips_existing_keys(self, state):
+        state.allocate("file_000000")
+        state.update("file_000000", status=FileStatus.CREATED)
+        added = state.allocate_batch(["file_000000", "file_000001"])
+        assert added == 1   # only file_000001 was new
+        # Existing entry must not be overwritten
+        assert state.get_file("file_000000")["status"] == FileStatus.CREATED
+
+    def test_single_disk_write_for_n_keys(self, state, state_path):
+        """After allocate_batch the file contains all N entries."""
+        keys = ["file_{:06d}".format(i) for i in range(10)]
+        state.allocate_batch(keys)
+        with open(state_path) as fh:
+            data = json.load(fh)
+        for k in keys:
+            assert k in data["files"]
+
+    def test_empty_batch_returns_zero(self, state):
+        added = state.allocate_batch([])
+        assert added == 0
+
+    def test_all_already_exist_returns_zero(self, state):
+        state.allocate("file_000000")
+        added = state.allocate_batch(["file_000000"])
+        assert added == 0
+
+    def test_no_tmp_file_left_behind(self, state, state_path, tmp_path):
+        state.allocate_batch(["file_000000", "file_000001"])
+        tmp_files = [f for f in os.listdir(tmp_path) if f.endswith(".tmp")]
+        assert tmp_files == []
+
+
+# ---------------------------------------------------------------------------
 # Update
 # ---------------------------------------------------------------------------
 
@@ -198,6 +248,92 @@ class TestSnapshot:
         snap["files"]["file_000000"]["status"] = "mutated"
         entry = state.get_file("file_000000")
         assert entry["status"] == FileStatus.PENDING   # internal unchanged
+
+
+# ---------------------------------------------------------------------------
+# Flush / write-behind
+# ---------------------------------------------------------------------------
+
+class TestFlushInterval:
+    def test_flush_interval_one_writes_every_update(self, state_path):
+        """flush_interval=1 (default) persists every update immediately."""
+        sf = StateFile(path=state_path, run_id="run1", flush_interval=1)
+        sf.allocate("file_000000")
+        sf.update("file_000000", status=FileStatus.CREATED)
+        with open(state_path) as fh:
+            data = json.load(fh)
+        assert data["files"]["file_000000"]["status"] == FileStatus.CREATED
+
+    def test_flush_interval_defers_writes(self, state_path):
+        """flush_interval=10 holds updates in memory and does not flush immediately."""
+        sf = StateFile(path=state_path, run_id="run1", flush_interval=10)
+        sf.allocate("file_000000")
+        # update #1 — dirty=1, below threshold; state on disk still shows PENDING
+        sf.update("file_000000", status=FileStatus.CREATED)
+        with open(state_path) as fh:
+            data = json.load(fh)
+        # allocate() always flushes immediately, so file_000000 exists on disk
+        # but the status update has not been flushed yet.
+        assert data["files"]["file_000000"]["status"] == FileStatus.PENDING
+
+    def test_flush_interval_triggers_at_threshold(self, state_path):
+        """When dirty count reaches flush_interval, the file is written."""
+        n = 5
+        sf = StateFile(path=state_path, run_id="run1", flush_interval=n)
+        for i in range(n):
+            key = "file_{:06d}".format(i)
+            sf.allocate(key)
+        for i in range(n):
+            key = "file_{:06d}".format(i)
+            sf.update(key, status=FileStatus.CREATED)
+        # After n updates dirty==n which equals flush_interval → flushed
+        with open(state_path) as fh:
+            data = json.load(fh)
+        for i in range(n):
+            assert data["files"]["file_{:06d}".format(i)]["status"] == FileStatus.CREATED
+
+    def test_flush_forces_write(self, state_path):
+        """flush() persists buffered updates immediately."""
+        sf = StateFile(path=state_path, run_id="run1", flush_interval=100)
+        sf.allocate("file_000000")
+        sf.update("file_000000", status=FileStatus.REGISTERED)
+        # Not yet flushed (dirty < 100)
+        with open(state_path) as fh:
+            data = json.load(fh)
+        assert data["files"]["file_000000"]["status"] == FileStatus.PENDING
+        # Now flush
+        sf.flush()
+        with open(state_path) as fh:
+            data = json.load(fh)
+        assert data["files"]["file_000000"]["status"] == FileStatus.REGISTERED
+
+    def test_flush_noop_when_clean(self, state_path):
+        """flush() on a clean (unflushed-interval==1) state does not raise."""
+        sf = StateFile(path=state_path, run_id="run1", flush_interval=1)
+        sf.allocate("file_000000")
+        sf.update("file_000000", status=FileStatus.CREATED)
+        sf.flush()  # dirty=0 already — must not raise
+
+    def test_flush_resets_dirty_counter(self, state_path):
+        """After flush(), the dirty counter is reset to 0."""
+        sf = StateFile(path=state_path, run_id="run1", flush_interval=100)
+        sf.allocate("file_000000")
+        sf.update("file_000000", status=FileStatus.CREATED)
+        assert sf._dirty == 1
+        sf.flush()
+        assert sf._dirty == 0
+
+    def test_in_memory_state_always_current(self, state_path):
+        """get_file() returns the current in-memory value even before flush."""
+        sf = StateFile(path=state_path, run_id="run1", flush_interval=100)
+        sf.allocate("file_000000")
+        sf.update("file_000000", status=FileStatus.REGISTERED, bytes=512)
+        # In-memory is up to date:
+        assert sf.get_file("file_000000")["status"] == FileStatus.REGISTERED
+        # On-disk is still at PENDING (not yet flushed):
+        with open(state_path) as fh:
+            data = json.load(fh)
+        assert data["files"]["file_000000"]["status"] == FileStatus.PENDING
 
 
 # ---------------------------------------------------------------------------

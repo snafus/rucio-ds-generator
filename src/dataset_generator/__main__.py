@@ -247,6 +247,31 @@ def _build_parser():
         ),
     )
     ovr.add_argument(
+        "--pool-chunksize", dest="pool_chunksize", type=int, metavar="N",
+        help=(
+            "Number of file-generation tasks sent to each worker per IPC round-trip. "
+            "0 (default): auto-computed as max(1, num_files // (threads * 4)). "
+            "Increase for large file counts (>10k) to reduce IPC overhead."
+        ),
+    )
+    ovr.add_argument(
+        "--state-flush-interval", dest="state_flush_interval", type=int, metavar="N",
+        help=(
+            "Write the state file to disk every N update() calls (default: 100). "
+            "1 flushes on every update (safe but slow at 100k files). "
+            "Higher values reduce I/O at the cost of losing more progress on crash."
+        ),
+    )
+    ovr.add_argument(
+        "--pfn-batch-size", dest="pfn_batch_size", type=int, metavar="N",
+        help=(
+            "Number of LFNs resolved per lfns2pfns Rucio API call. "
+            "0: resolve all at once (one call total). "
+            "Default: 1000. Larger values reduce HTTP round-trips but "
+            "increase memory pressure if the Rucio server is slow."
+        ),
+    )
+    ovr.add_argument(
         "--no-xattr", dest="xattr", action="store_false", default=None,
         help=(
             "Disable writing the XrdCks adler32 extended attribute "
@@ -666,7 +691,11 @@ def main():
     # Load or create state file.
     # ------------------------------------------------------------------
     try:
-        state = StateFile(path=config.state_file_path, run_id=config.run_id)
+        state = StateFile(
+            path=config.state_file_path,
+            run_id=config.run_id,
+            flush_interval=config.state_flush_interval,
+        )
     except Exception as exc:
         log.error("State file error: %s", exc)
         sys.exit(2)
@@ -738,10 +767,17 @@ def main():
             failures = _run_full_pipeline(config, state, rucio_manager, registry=registry)
     except KeyboardInterrupt:
         log.warning("Interrupted — state saved to %s", config.state_file_path)
+        state.flush()
         sys.exit(1)
     except Exception as exc:
         log.exception("Unhandled error: %s", exc)
+        state.flush()
         sys.exit(1)
+    else:
+        # Normal exit: flush any state updates buffered by flush_interval
+        # (registration/rule updates in _register_replicas and pipeline functions).
+        # run_generation already flushes its own updates; this covers phases 2–3.
+        state.flush()
 
     if failures:
         log.warning("Run finished with %d failure(s). State: %s", failures, config.state_file_path)

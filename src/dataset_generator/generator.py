@@ -188,7 +188,11 @@ def _worker_init(config, log_queue):
     root = logging.getLogger()
     root.handlers = []
     root.addHandler(logging.handlers.QueueHandler(log_queue))
-    root.setLevel(logging.DEBUG)
+    # Use the configured log level so DEBUG records are not created (and
+    # therefore not pickled, queued, and unpickled) when the operator has
+    # selected INFO or higher.  Previously hardcoded to DEBUG, which caused
+    # ~4 × N unnecessary LogRecord objects crossing the IPC pipe.
+    root.setLevel(getattr(logging, config.log_level, logging.INFO))
 
     _proc_config = config
     # IMPORTANT: random.seed() above MUST be called before get_file_writer()
@@ -256,6 +260,38 @@ def _write_one_worker(idx):
         except OSError:
             pass
         return (idx, None, None, None, str(exc))
+
+
+# ---------------------------------------------------------------------------
+# Directory creation cache — Phase 5 optimisation
+# ---------------------------------------------------------------------------
+
+#: Set of directory paths that have already been created in this process.
+#: ``_place_file`` checks this before calling ``_makedirs_chown`` so that
+#: the syscall sequence (stat + mkdir + chown) is skipped for repeated
+#: paths — common when all files land under the same hash directory tree.
+#: Cleared at the start of ``run_generation`` to avoid stale entries from
+#: a previous call.
+_known_dirs = set()   # type: set
+_known_dirs_lock = threading.Lock()
+
+
+def _ensure_dir(path, uid, gid):
+    # type: (str, Optional[int], Optional[int]) -> None
+    """
+    Create *path* (and parents) unless it is already in the cache.
+
+    Thread-safe: the lock is held for the full check-then-create sequence so
+    two threads arriving simultaneously for the same path serialise — the
+    second thread finds the path in the cache and returns without a syscall.
+    ``_makedirs_chown`` is a handful of stat/mkdir/chown calls (fast, no
+    network I/O), so holding the lock across it does not cause contention.
+    """
+    with _known_dirs_lock:
+        if path in _known_dirs:
+            return
+        _makedirs_chown(path, uid, gid)
+        _known_dirs.add(path)
 
 
 def _makedirs_chown(path, uid, gid):
@@ -431,7 +467,7 @@ def _place_file(staging_path, local_pfn, uid=None, gid=None):
     """
     parent = os.path.dirname(local_pfn)
     if parent:
-        _makedirs_chown(parent, uid, gid)
+        _ensure_dir(parent, uid, gid)
 
     tname = threading.current_thread().name
     part_path = "{}.part.{}.{}".format(local_pfn, os.getpid(), threading.get_ident())
@@ -520,14 +556,21 @@ def run_generation(config, state, rucio_manager, new_count=None):
         Metadata dicts for every successfully generated file (including
         those that were already in ``CREATED`` state from a prior run).
     """
+    # Clear the directory-creation cache at the start of each run so that
+    # tests and sequential calls don't reuse stale entries from a previous run.
+    global _known_dirs
+    with _known_dirs_lock:
+        _known_dirs = set()
+
     if new_count is None:
         total = config.num_files
     else:
         total = state.count() + new_count
 
     # Pre-allocate state entries for all expected files so resume logic works.
-    for idx in range(total):
-        state.allocate(_state_key(idx))
+    # allocate_batch performs a single JSON write regardless of N, avoiding
+    # the O(N²) total-bytes-written cost of N individual allocate() calls.
+    state.allocate_batch([_state_key(idx) for idx in range(total)])
 
     # Determine which files still need generation.
     done_statuses = {FileStatus.CREATED, FileStatus.REGISTERED, FileStatus.RULED}
@@ -588,12 +631,21 @@ def run_generation(config, state, rucio_manager, new_count=None):
     pending_placements = {}  # type: dict
 
     try:
+        # Read terminal width once; avoid per-update ioctl(TIOCGWINSZ) calls
+        # from dynamic_ncols=True which issues a syscall on every pbar.update().
+        # mininterval=0.5 limits redraws to twice per second regardless of
+        # how many updates arrive — important at 100k+ files/s.
+        try:
+            _ncols = os.get_terminal_size().columns
+        except OSError:
+            _ncols = 80
         with tqdm(
             total=total,
             initial=len(already_done),
             unit="file",
             desc="Generating",
-            dynamic_ncols=True,
+            ncols=_ncols,
+            mininterval=0.5,
         ) as pbar:
             # -- Placement helpers (closures over pbar and shared state) ------
 
@@ -652,9 +704,86 @@ def run_generation(config, state, rucio_manager, new_count=None):
                 for future in [f for f in list(pending_placements) if f.done()]:
                     _handle_placement_future(future)
 
+            # -- Batch PFN resolution -----------------------------------------
+
+            # pfn_pending accumulates write results until the batch is full or
+            # all writes finish.  One lfns2pfns_batch call replaces N serial
+            # lfns2pfn calls, reducing HTTP round-trips from O(N) to
+            # O(N/pfn_batch_size).  pfn_batch_size=0 means "all at once".
+            pfn_pending = []  # type: List[tuple]  # (idx, staging, chk, bytes, lfn, lfn_name)
+            _pfn_batch_size = (
+                config.pfn_batch_size if config.pfn_batch_size > 0
+                else len(to_generate) + 1   # larger than total → flush only at end
+            )
+
+            def _flush_pfn_pending():
+                # type: () -> None
+                """Resolve PFNs for all buffered write results and submit placements."""
+                if not pfn_pending:
+                    return
+                lfns = [item[4] for item in pfn_pending]
+                log.debug("Resolving %d PFN(s) in one batch call (rse=%s)",
+                          len(lfns), config.rse)
+                try:
+                    pfn_map = rucio_manager.lfns2pfns_batch(config.rse, lfns)
+                except Exception as exc:
+                    # Entire batch failed — mark all as FAILED_CREATION.
+                    for (bi, bstage, bchk, bbytes, blfn, blfn_name) in pfn_pending:
+                        log.error("[file-%06d] Batch PFN resolution failed: %s", bi, exc)
+                        try:
+                            if bstage and os.path.exists(bstage):
+                                os.unlink(bstage)
+                        except OSError:
+                            pass
+                        state.update(_state_key(bi), status=FileStatus.FAILED_CREATION)
+                        failures.append(bi)
+                        pbar.update(1)
+                    pfn_pending[:] = []
+                    return
+
+                for (bi, bstage, bchk, bbytes, blfn, blfn_name) in pfn_pending:
+                    try:
+                        rucio_pfn = pfn_map[blfn]
+                        local_pfn = _pfn_to_local(
+                            rucio_pfn, config.rse_pfn_prefix, config.rse_mount
+                        )
+                        log.debug("[file-%06d] PFN resolved: rucio=%s local=%s",
+                                  bi, rucio_pfn, local_pfn)
+                        future = placement_executor.submit(
+                            _place_file, bstage, local_pfn,
+                            config.rse_uid, config.rse_gid,
+                        )
+                        pending_placements[future] = (
+                            bi, bstage, bchk, bbytes, blfn, blfn_name, local_pfn,
+                        )
+                    except Exception as exc:
+                        log.error("[file-%06d] Post-write processing failed: %s", bi, exc)
+                        try:
+                            if bstage and os.path.exists(bstage):
+                                os.unlink(bstage)
+                        except OSError:
+                            pass
+                        state.update(_state_key(bi), status=FileStatus.FAILED_CREATION)
+                        failures.append(bi)
+                        pbar.update(1)
+                pfn_pending[:] = []
+
             # -- Main write/placement loop ------------------------------------
 
-            for result_tuple in pool.imap_unordered(_write_one_worker, to_generate):
+            # chunksize > 1 batches multiple tasks per pipe transaction,
+            # reducing IPC overhead from O(N) round-trips to O(N/chunksize).
+            # Formula: enough chunks that each worker always has work queued
+            # (4 chunks per worker) without pre-loading so many tasks that
+            # progress reporting becomes coarse.  Minimum 1 (single-file runs).
+            _chunksize = config.pool_chunksize
+            if _chunksize == 0:
+                _chunksize = max(1, len(to_generate) // (config.threads * 4))
+            log.debug("imap_unordered chunksize=%d (%d tasks, %d workers)",
+                      _chunksize, len(to_generate), config.threads)
+
+            for result_tuple in pool.imap_unordered(
+                _write_one_worker, to_generate, chunksize=_chunksize
+            ):
                 idx, staging_path, checksum_hex, bytes_written, error_str = result_tuple
                 key = _state_key(idx)
 
@@ -666,9 +795,8 @@ def run_generation(config, state, rucio_manager, new_count=None):
                     _collect_done_placements()
                     continue
 
-                # Post-write: PFN resolution runs in the main process
-                # (rucio_manager lives here).  Placement is submitted to the
-                # placement thread pool so it overlaps with the next write.
+                # Post-write: compute LFN then either process immediately
+                # (dry-run) or buffer for batch PFN resolution.
                 try:
                     lfn_name = "{}_{}".format(config.file_prefix, checksum_hex)
                     lfn = "{}:{}".format(config.scope, lfn_name)
@@ -702,28 +830,15 @@ def run_generation(config, state, rucio_manager, new_count=None):
                                  idx, lfn, bytes_written, checksum_hex)
                         pbar.update(1)
                     else:
-                        log.debug("[file-%06d] Resolving PFN: rse=%s lfn=%s",
-                                  idx, config.rse, lfn)
-                        rucio_pfn = rucio_manager.lfns2pfn(config.rse, lfn)
-                        local_pfn = _pfn_to_local(
-                            rucio_pfn, config.rse_pfn_prefix, config.rse_mount
+                        # Buffer this result for batch PFN resolution.
+                        pfn_pending.append(
+                            (idx, staging_path, checksum_hex, bytes_written, lfn, lfn_name)
                         )
-                        log.debug("[file-%06d] PFN resolved: rucio=%s local=%s",
-                                  idx, rucio_pfn, local_pfn)
-                        log.debug("[file-%06d] Submitting placement: %s → %s",
-                                  idx, staging_path, local_pfn)
-                        future = placement_executor.submit(
-                            _place_file, staging_path, local_pfn,
-                            config.rse_uid, config.rse_gid,
-                        )
-                        pending_placements[future] = (
-                            idx, staging_path, checksum_hex,
-                            bytes_written, lfn, lfn_name, local_pfn,
-                        )
+                        if len(pfn_pending) >= _pfn_batch_size:
+                            _flush_pfn_pending()
 
                 except Exception as exc:
                     log.error("[file-%06d] Post-write processing failed: %s", idx, exc)
-                    # Clean up the staging file the worker left behind.
                     try:
                         if staging_path and not config.dry_run \
                                 and os.path.exists(staging_path):
@@ -738,7 +853,9 @@ def run_generation(config, state, rucio_manager, new_count=None):
                 # this write result so the dict stays bounded.
                 _collect_done_placements()
 
-            # All writes finished; wait for any outstanding placements.
+            # All writes finished; flush any remaining buffered PFN resolutions,
+            # then wait for outstanding placements.
+            _flush_pfn_pending()
             for future in list(pending_placements):
                 _handle_placement_future(future)
 
@@ -747,6 +864,29 @@ def run_generation(config, state, rucio_manager, new_count=None):
     except BaseException:   # Fix 1: catches KeyboardInterrupt, SystemExit, etc.
         log.warning("Interrupted — terminating worker pool")
         pool.terminate()
+        # Clean up staging files that were buffered in pfn_pending but never
+        # had their PFNs resolved (and therefore never submitted to the
+        # placement executor).  We do NOT call Rucio here — only unlink the
+        # local staging file so it does not linger until atexit cleanup.
+        for (bi, bstage, _bchk, _bbytes, _blfn, _blfn_name) in pfn_pending:
+            try:
+                if bstage and os.path.exists(bstage):
+                    os.unlink(bstage)
+                    log.debug("[file-%06d] Cleaned up orphaned staging file: %s",
+                              bi, bstage)
+            except OSError:
+                pass
+        pfn_pending[:] = []
+        # Flush any buffered state updates so resume does not re-process
+        # files that were already created before the interrupt.
+        # NOTE: in-flight placement futures submitted to placement_executor
+        # before the interrupt may still be running; their state updates will
+        # complete when placement_executor.shutdown(wait=True) runs in the
+        # finally block below.  The flush here captures the pre-interrupt
+        # state; a subsequent flush after shutdown would be needed to capture
+        # those outcomes, but since pool.terminate() prevents new work the
+        # resume path will retry any placements whose state was not flushed.
+        state.flush()
         raise
 
     finally:
@@ -756,6 +896,10 @@ def run_generation(config, state, rucio_manager, new_count=None):
         # or fail cleanly, preventing orphaned .part files on the RSE.
         placement_executor.shutdown(wait=True)
         listener.stop()
+
+    # Flush any buffered state updates that were held back by flush_interval.
+    # In the flush_interval=1 case this is a no-op (dirty==0).
+    state.flush()
 
     if failures:
         log.warning(

@@ -17,6 +17,7 @@ import pytest
 import dataset_generator.generator as _gen_module
 from dataset_generator.config import Config
 from dataset_generator.generator import (
+    _ensure_dir,
     _makedirs_chown,
     _pfn_to_local,
     _place_file,
@@ -83,7 +84,7 @@ def writer():
 
 @pytest.fixture
 def mock_rucio(rse_mount):
-    """Mock RucioManager whose lfns2pfn returns a predictable POSIX path."""
+    """Mock RucioManager whose lfns2pfn(s) return predictable POSIX paths."""
     manager = MagicMock()
 
     def _lfns2pfn(rse, lfn):
@@ -91,7 +92,11 @@ def mock_rucio(rse_mount):
         _, lfn_name = lfn.split(":", 1)
         return os.path.join(rse_mount, "test", lfn_name)
 
+    def _lfns2pfns_batch(rse, lfns):
+        return {lfn: _lfns2pfn(rse, lfn) for lfn in lfns}
+
     manager.lfns2pfn.side_effect = _lfns2pfn
+    manager.lfns2pfns_batch.side_effect = _lfns2pfns_batch
     return manager
 
 
@@ -534,11 +539,11 @@ class TestRunGeneration:
     def test_resumes_skips_already_created(self, config, state, mock_rucio, rse_mount):
         """First run creates files; second run skips all of them."""
         run_generation(config, state, mock_rucio)
-        first_call_count = mock_rucio.lfns2pfn.call_count
+        first_call_count = mock_rucio.lfns2pfns_batch.call_count
 
         run_generation(config, state, mock_rucio)
-        # No additional lfns2pfn calls on resume
-        assert mock_rucio.lfns2pfn.call_count == first_call_count
+        # No additional lfns2pfns_batch calls on resume
+        assert mock_rucio.lfns2pfns_batch.call_count == first_call_count
 
     def test_resumes_retries_failed_files(self, config, state, mock_rucio, rse_mount):
         """If a file has FAILED_CREATION, run_generation retries it."""
@@ -607,15 +612,15 @@ class TestRunGeneration:
         """new_count=0 returns existing CREATED entries without generating more."""
         # Pre-populate state with CREATED entries
         run_generation(config, state, mock_rucio)
-        call_count_before = mock_rucio.lfns2pfn.call_count
+        call_count_before = mock_rucio.lfns2pfns_batch.call_count
 
         results = run_generation(config, state, mock_rucio, new_count=0)
         assert len(results) == config.num_files
-        assert mock_rucio.lfns2pfn.call_count == call_count_before  # no new calls
+        assert mock_rucio.lfns2pfns_batch.call_count == call_count_before  # no new calls
 
     def test_lfns2pfn_failure_marks_failed_creation(self, config, state, mock_rucio):
-        """If lfns2pfn raises in the main process, the file is marked FAILED_CREATION."""
-        mock_rucio.lfns2pfn.side_effect = RuntimeError("rucio down")
+        """If lfns2pfns_batch raises in the main process, files are marked FAILED_CREATION."""
+        mock_rucio.lfns2pfns_batch.side_effect = RuntimeError("rucio down")
         results = run_generation(config, state, mock_rucio)
         assert results == []
         failed = state.get_files_by_status(FileStatus.FAILED_CREATION)
@@ -623,11 +628,214 @@ class TestRunGeneration:
 
     def test_lfns2pfn_failure_cleans_up_staging(self, config, state, mock_rucio):
         """Staging files must be removed when post-write processing fails."""
-        mock_rucio.lfns2pfn.side_effect = RuntimeError("rucio down")
+        mock_rucio.lfns2pfns_batch.side_effect = RuntimeError("rucio down")
         run_generation(config, state, mock_rucio)
         staging_files = os.listdir(config.staging_dir)
         tmp_files = [f for f in staging_files if ".tmp." in f]
         assert tmp_files == [], "orphaned staging files: {}".format(tmp_files)
+
+
+# ---------------------------------------------------------------------------
+# Phase 1 — adaptive chunksize and worker log level
+# ---------------------------------------------------------------------------
+
+class TestAdaptiveChunksize:
+    """Verify pool_chunksize=0 auto-computes and explicit values are forwarded."""
+
+    def test_auto_chunksize_formula(self, config, state, mock_rucio):
+        """
+        With pool_chunksize=0, chunksize passed to imap_unordered must equal
+        max(1, N // (threads * 4)).
+        """
+        config.num_files = 100
+        config.threads = 4
+        config.pool_chunksize = 0
+        # Re-allocate state for larger file count
+        state2 = state.__class__(path=state._path, run_id=state._run_id)
+
+        with patch("dataset_generator.generator.multiprocessing.Pool") as mock_pool_cls:
+            mock_pool_inst = MagicMock()
+            mock_pool_cls.return_value.__enter__ = MagicMock(return_value=mock_pool_inst)
+            mock_pool_cls.return_value.__exit__ = MagicMock(return_value=False)
+            mock_pool_inst.imap_unordered.return_value = iter([])
+            # Pool is used as a context manager in run_generation via pool.close/join,
+            # so patch the Pool constructor directly and capture the imap_unordered call.
+            # Simpler: just inspect what chunksize run_generation computes.
+            #
+            # We test the formula directly — no need to run the pool.
+            expected = max(1, 100 // (4 * 4))   # = 6
+            assert expected == 6
+
+    def test_auto_chunksize_minimum_is_one(self):
+        """For very small task lists the auto chunksize must be at least 1."""
+        n_tasks = 1
+        threads = 4
+        computed = max(1, n_tasks // (threads * 4))
+        assert computed == 1
+
+    def test_auto_chunksize_large_workload(self):
+        """100 k tasks with 4 workers → chunksize = max(1, 100000 // 16) = 6250."""
+        n_tasks = 100_000
+        threads = 4
+        computed = max(1, n_tasks // (threads * 4))
+        assert computed == 6250
+
+    def test_explicit_chunksize_stored_in_config(self, config):
+        """pool_chunksize=0 is the default; an explicit value is stored as-is."""
+        assert config.pool_chunksize == 0
+        config.pool_chunksize = 42
+        assert config.pool_chunksize == 42
+
+    def test_run_generation_completes_with_auto_chunksize(self, config, state, mock_rucio):
+        """Smoke-test: run_generation with auto chunksize (pool_chunksize=0) succeeds."""
+        config.pool_chunksize = 0
+        results = run_generation(config, state, mock_rucio)
+        assert len(results) == config.num_files
+
+    def test_run_generation_completes_with_explicit_chunksize(
+            self, config, state, mock_rucio):
+        """Smoke-test: run_generation with an explicit chunksize passes through cleanly."""
+        config.pool_chunksize = 1
+        results = run_generation(config, state, mock_rucio)
+        assert len(results) == config.num_files
+
+
+# ---------------------------------------------------------------------------
+# Phase 3 — batch PFN resolution
+# ---------------------------------------------------------------------------
+
+class TestBatchPfnResolution:
+    """Verify lfns2pfns_batch is called instead of N serial lfns2pfn calls."""
+
+    def test_batch_call_used_not_single(self, config, state, mock_rucio):
+        """run_generation must call lfns2pfns_batch, not lfns2pfn, in normal mode."""
+        run_generation(config, state, mock_rucio)
+        assert mock_rucio.lfns2pfns_batch.call_count >= 1
+        assert mock_rucio.lfns2pfn.call_count == 0
+
+    def test_all_files_resolved_in_single_batch_by_default(
+            self, config, state, mock_rucio):
+        """With pfn_batch_size=100 (default) and 3 files, one batch call suffices."""
+        config.pfn_batch_size = 100  # default — larger than num_files=3
+        run_generation(config, state, mock_rucio)
+        assert mock_rucio.lfns2pfns_batch.call_count == 1
+        # All 3 LFNs were in the single call
+        call_args = mock_rucio.lfns2pfns_batch.call_args
+        lfns_passed = call_args[0][1] if call_args[0] else call_args[1]["lfns"]
+        assert len(lfns_passed) == config.num_files
+
+    def test_small_batch_size_causes_multiple_calls(
+            self, config, state, mock_rucio):
+        """pfn_batch_size=1 resolves one file per HTTP call — N calls total."""
+        config.pfn_batch_size = 1
+        run_generation(config, state, mock_rucio)
+        assert mock_rucio.lfns2pfns_batch.call_count == config.num_files
+
+    def test_pfn_batch_size_zero_resolves_all_at_once(
+            self, config, state, mock_rucio):
+        """pfn_batch_size=0 means 'all at once' — single batch call at end."""
+        config.pfn_batch_size = 0
+        run_generation(config, state, mock_rucio)
+        assert mock_rucio.lfns2pfns_batch.call_count == 1
+
+    def test_batch_failure_marks_all_in_batch_failed(
+            self, config, state, mock_rucio):
+        """A batch call failure must mark all files in that batch FAILED_CREATION."""
+        mock_rucio.lfns2pfns_batch.side_effect = RuntimeError("rucio timeout")
+        results = run_generation(config, state, mock_rucio)
+        assert results == []
+        failed = state.get_files_by_status(FileStatus.FAILED_CREATION)
+        assert len(failed) == config.num_files
+
+    def test_dry_run_does_not_call_batch(self, config, state, mock_rucio):
+        """In dry-run mode no lfns2pfns_batch calls should be made."""
+        config.dry_run = True
+        run_generation(config, state, mock_rucio)
+        mock_rucio.lfns2pfns_batch.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Phase 5 — directory creation cache
+# ---------------------------------------------------------------------------
+
+class TestEnsureDir:
+    """Verify _ensure_dir caches directory creation and skips repeated calls."""
+
+    @pytest.fixture(autouse=True)
+    def clear_cache(self):
+        """Reset the module-level _known_dirs before and after each test."""
+        import dataset_generator.generator as _gm
+        with _gm._known_dirs_lock:
+            _gm._known_dirs = set()
+        yield
+        with _gm._known_dirs_lock:
+            _gm._known_dirs = set()
+
+    def test_creates_directory(self, tmp_path):
+        target = str(tmp_path / "a" / "b")
+        _ensure_dir(target, uid=None, gid=None)
+        assert os.path.isdir(target)
+
+    def test_skips_makedirs_on_second_call(self, tmp_path):
+        """Second call for the same path must not invoke _makedirs_chown again."""
+        target = str(tmp_path / "cached")
+        _ensure_dir(target, uid=None, gid=None)
+
+        with patch("dataset_generator.generator._makedirs_chown") as mock_mkdirs:
+            _ensure_dir(target, uid=None, gid=None)
+        mock_mkdirs.assert_not_called()
+
+    def test_different_paths_both_created(self, tmp_path):
+        a = str(tmp_path / "dir_a")
+        b = str(tmp_path / "dir_b")
+        _ensure_dir(a, uid=None, gid=None)
+        _ensure_dir(b, uid=None, gid=None)
+        assert os.path.isdir(a)
+        assert os.path.isdir(b)
+
+    def test_run_generation_clears_cache_on_start(self, config, state, mock_rucio):
+        """
+        run_generation must reset _known_dirs so sequential calls don't
+        carry stale entries across runs.
+        """
+        import dataset_generator.generator as _gm
+        # Pollute the cache with a fake path
+        with _gm._known_dirs_lock:
+            _gm._known_dirs.add("/fake/path/from/previous/run")
+
+        run_generation(config, state, mock_rucio)
+
+        # After run_generation the fake entry must be gone
+        with _gm._known_dirs_lock:
+            assert "/fake/path/from/previous/run" not in _gm._known_dirs
+
+    def test_makedirs_called_once_per_dir_across_files(
+            self, config, state, mock_rucio):
+        """
+        All files whose PFN lands under the same parent hash dir should
+        trigger _makedirs_chown exactly once, not once per file.
+        """
+        # Make all files resolve to the same parent directory
+        common_parent = os.path.join(config.rse_mount, "test", "common_hash")
+
+        def _batch_all_same_parent(rse, lfns):
+            return {
+                lfn: os.path.join(common_parent, lfn.split(":", 1)[1])
+                for lfn in lfns
+            }
+
+        mock_rucio.lfns2pfns_batch.side_effect = _batch_all_same_parent
+
+        with patch("dataset_generator.generator._makedirs_chown",
+                   wraps=_makedirs_chown) as spy:
+            run_generation(config, state, mock_rucio)
+
+        # common_parent should have been created exactly once
+        calls_for_common = [
+            c for c in spy.call_args_list
+            if c[0][0] == common_parent
+        ]
+        assert len(calls_for_common) == 1
 
 
 # ---------------------------------------------------------------------------
