@@ -109,7 +109,7 @@ def _set_xrdcks_xattr(path, adler32_int):
     Rsvd1         2      int16      host            reserved (0)
     Rsvd2         1      uint8      host            reserved (0)
     Length        1      uint8      host            value length in bytes
-    Value         64     uint8[64]  host (first 4)  adler32 in first 4 B
+    Value         64     uint8[64]  big-endian      adler32 in first 4 B
     ============  =====  =========  ==============  =====================
 
     Parameters
@@ -128,8 +128,10 @@ def _set_xrdcks_xattr(path, adler32_int):
     times = struct.pack(">qi", fm_time, now)    # 8 + 4 = 12 bytes
     # Rsvd1 (int16), Rsvd2 (uint8), Length (uint8 = 4): host byte order.
     meta = struct.pack("=hBB", 0, 0, 4)         # 4 bytes
-    # Value: adler32 in first 4 bytes (host byte order), rest zero-padded.
-    value = struct.pack("=I", adler32_int) + b"\x00" * 60  # 64 bytes
+    # Value: adler32 in first 4 bytes (big-endian), rest zero-padded.
+    # XRootD reads Value[0] as a big-endian uint32 (matching fmTime/csTime).
+    # Using host/LE order here causes a byte-reversed checksum mismatch.
+    value = struct.pack(">I", adler32_int) + b"\x00" * 60  # 64 bytes
     blob = name_bytes + times + meta + value    # 16+12+4+64 = 96 bytes
     os.setxattr(path, _XRDCKS_XATTR_NAME, blob)
 

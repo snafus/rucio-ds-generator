@@ -871,14 +871,15 @@ class TestSetXrdcksXattr:
         assert blob[:8] == b"adler32\x00"
         assert blob[8:16] == b"\x00" * 8
 
-    def test_adler32_value_stored_host_order(self, tmp_path):
+    def test_adler32_value_stored_big_endian(self, tmp_path):
         path = str(tmp_path / "f")
         open(path, "wb").close()
         adler = 0xCAFEBABE
         _set_xrdcks_xattr(path, adler)
         blob = self._read_blob(path)
-        # Value field starts at offset 32; first 4 bytes, host byte order.
-        stored = _struct.unpack("=I", blob[32:36])[0]
+        # Value field starts at offset 32; first 4 bytes, big-endian.
+        # XRootD reads Value[0] as big-endian uint32 (same as fmTime/csTime).
+        stored = _struct.unpack(">I", blob[32:36])[0]
         assert stored == adler
 
     def test_length_field_is_4(self, tmp_path):
@@ -930,8 +931,8 @@ class TestXattrIntegration:
         for entry in created:
             blob = os.getxattr(entry["pfn"], _XRDCKS_XATTR_NAME)
             assert len(blob) == 96
-            # Value field: stored adler32 must match the state entry.
-            stored = _struct.unpack("=I", blob[32:36])[0]
+            # Value field: stored adler32 must match the state entry (big-endian).
+            stored = _struct.unpack(">I", blob[32:36])[0]
             assert stored == int(entry["adler32"], 16)
 
     def test_xattr_not_written_when_disabled(self, config, state, mock_rucio):
