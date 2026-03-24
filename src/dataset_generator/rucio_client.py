@@ -65,6 +65,10 @@ log = logging.getLogger(__name__)
 MAX_RETRIES = 3
 RETRY_DELAYS = (2, 4, 8)  # seconds; index matches attempt number (0-based)
 
+# Maximum number of DIDs per single attach_dids / add_replicas call.
+# Rucio rejects or times out requests that exceed a few hundred DIDs.
+_DID_BATCH_SIZE = 500
+
 
 # ---------------------------------------------------------------------------
 # OIDC token container
@@ -514,12 +518,14 @@ class RucioManager(object):
             return
 
         client = self._make_client()
+        for start in range(0, len(files), _DID_BATCH_SIZE):
+            batch = files[start:start + _DID_BATCH_SIZE]
 
-        def _call():
-            client.add_replicas(rse=rse, files=files)
-            log.info("Registered %d replica(s) on %s", len(files), rse)
+            def _call(b=batch):
+                client.add_replicas(rse=rse, files=b)
+                log.info("Registered %d replica(s) on %s", len(b), rse)
 
-        self._retry(_call, "add_replicas({!r}, {} files)".format(rse, len(files)))
+            self._retry(_call, "add_replicas({!r}, {} files)".format(rse, len(batch)))
 
     def delete_replicas(self, rse, files):
         # type: (str, List[dict]) -> None
@@ -580,18 +586,20 @@ class RucioManager(object):
             return
 
         client = self._make_client()
+        for start in range(0, len(file_dids), _DID_BATCH_SIZE):
+            batch = file_dids[start:start + _DID_BATCH_SIZE]
 
-        def _call():
-            client.attach_dids(scope=scope, name=dataset_name, dids=file_dids)
-            log.info(
-                "Attached %d file(s) to dataset %s:%s",
-                len(file_dids), scope, dataset_name,
+            def _call(b=batch):
+                client.attach_dids(scope=scope, name=dataset_name, dids=b)
+                log.info(
+                    "Attached %d file(s) to dataset %s:%s",
+                    len(b), scope, dataset_name,
+                )
+
+            self._retry(
+                _call,
+                "attach_dids({!r}:{!r}, {} files)".format(scope, dataset_name, len(batch)),
             )
-
-        self._retry(
-            _call,
-            "attach_dids({!r}:{!r}, {} files)".format(scope, dataset_name, len(file_dids)),
-        )
 
     # ------------------------------------------------------------------
     # RSE checks
