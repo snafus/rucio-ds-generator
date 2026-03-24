@@ -17,6 +17,7 @@ from dataset_generator.rucio_client import (
     MAX_RETRIES,
     RETRY_DELAYS,
     RucioManager,
+    _DID_BATCH_SIZE,
     _OIDCToken,
 )
 
@@ -304,6 +305,24 @@ class TestAddReplicas:
             manager.add_replicas("TEST_RSE", [{"scope": "s", "name": "n", "bytes": 1, "adler32": "x"}])
             mock_cls.assert_not_called()
 
+    @patch("dataset_generator.rucio_client.requests.post")
+    def test_large_list_is_split_into_batches(self, mock_post, config):
+        mock_post.return_value = _make_token_response()
+        mock_client = MagicMock()
+        # Build _DID_BATCH_SIZE + 1 files to force two batches.
+        n = _DID_BATCH_SIZE + 1
+        files = [{"scope": "s", "name": "f{:04d}".format(i), "bytes": 1, "adler32": "aa"} for i in range(n)]
+        manager = _make_manager(config)
+        with patch("dataset_generator.rucio_client.Client", return_value=mock_client):
+            manager.add_replicas("TEST_RSE", files)
+
+        assert mock_client.add_replicas.call_count == 2
+        first_call_files = mock_client.add_replicas.call_args_list[0][1]["files"]
+        second_call_files = mock_client.add_replicas.call_args_list[1][1]["files"]
+        assert len(first_call_files) == _DID_BATCH_SIZE
+        assert len(second_call_files) == 1
+        assert first_call_files + second_call_files == files
+
 
 # ---------------------------------------------------------------------------
 # delete_replicas
@@ -356,6 +375,24 @@ class TestAttachDids:
         with patch("dataset_generator.rucio_client.Client") as mock_cls:
             manager.attach_dids("test", "ds", [{"scope": "s", "name": "n"}])
             mock_cls.assert_not_called()
+
+    @patch("dataset_generator.rucio_client.requests.post")
+    def test_large_list_is_split_into_batches(self, mock_post, config):
+        mock_post.return_value = _make_token_response()
+        mock_client = MagicMock()
+        # Build _DID_BATCH_SIZE + 3 DIDs to force two batches.
+        n = _DID_BATCH_SIZE + 3
+        dids = [{"scope": "test", "name": "f{:04d}".format(i)} for i in range(n)]
+        manager = _make_manager(config)
+        with patch("dataset_generator.rucio_client.Client", return_value=mock_client):
+            manager.attach_dids("test", "my_ds", dids)
+
+        assert mock_client.attach_dids.call_count == 2
+        first_batch = mock_client.attach_dids.call_args_list[0][1]["dids"]
+        second_batch = mock_client.attach_dids.call_args_list[1][1]["dids"]
+        assert len(first_batch) == _DID_BATCH_SIZE
+        assert len(second_batch) == 3
+        assert first_batch + second_batch == dids
 
 
 # ---------------------------------------------------------------------------
